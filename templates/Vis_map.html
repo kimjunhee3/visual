@@ -1,0 +1,150 @@
+#Vis_map.html
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>KBO 구장 지도</title>
+  <style>
+    body { background: #f3f4f6; font-family: 'Noto Sans KR', sans-serif; margin: 0; }
+    .header { text-align: center; padding: 20px; background: linear-gradient(135deg, #1a73e8, #34a853); color: white; }
+    .map-container { position: relative; width: 800px; height: 1000px; margin: 40px auto; }
+    .korea-map { width: 100%; border-radius: 12px; box-shadow: 0 0 10px rgba(0,0,0,0.15); display: block; }
+    .team-marker { position: absolute; min-width: 40px; background: white; border: 2px solid #1a73e8; border-radius: 10px;
+      font-size: 13px; padding: 4px 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); text-align: center; transform: translate(-50%, -50%);
+      white-space: nowrap; cursor: pointer; transition: all 0.3s ease; font-weight: bold; z-index: 2; }
+    .team-marker:hover { background: #1a73e8; color: white; transform: translate(-50%, -50%) scale(1.1); }
+    .footer { text-align: center; padding: 20px; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🏟️ KBO 구장 지도</h1>
+    <p>구장을 클릭하여 입장하세요!</p>
+  
+    <!-- 서버에서 전달된 selected_team을 안전하게 주입(보이지 않음) -->
+    <div id="server-data" data-selected-team="{{ selected_team|default('') }}" style="display:none;"></div>
+  
+    <div style="margin-top:10px;">
+      <label for="team-select" style="color:white; font-weight:bold; margin-right:8px;">팀 선택:</label>
+      <select id="team-select" style="padding:6px 10px; border-radius:6px; font-weight:bold;"></select>
+    </div>
+  </div>
+  
+  <div class="map-container">
+    <img src="/static/kr.svg" alt="Korea Map" class="korea-map" />
+    <div id="markers"></div>
+  </div>
+
+  <div class="footer">
+    <p>📊 실시간 KBO 데이터와 함께 야구장을 체험해보세요!</p>
+  </div>
+
+  <script>
+  // 서버 주입값 (data-attribute), URL 쿼리, localStorage를 우선순위로 사용
+  const serverEl = document.getElementById('server-data');
+  const serverTeam = serverEl && serverEl.dataset.selectedTeam ? serverEl.dataset.selectedTeam : '';
+  const urlTeam = (new URLSearchParams(window.location.search)).get('team') || '';
+  let selectedTeam = serverTeam || urlTeam || localStorage.getItem('kbo_selected_team') || null;
+
+  // ✅ 앞단에서도 공백/보이지 않는 문자 정리(백엔드와 동일 취지)
+  const INVIS_RE = /[\s\u00A0\u200B-\u200D\u202F\uFEFF]+/g;
+  const clean = s => (s || '').toString().replace(INVIS_RE, '');
+
+  // ✅ 표시명 → CSV 정식 구장명 매핑(필요시 추가)
+  const STADIUM_ALIASES = {
+    "잠실": "잠실",
+    "고척": "고척",
+    "문학": "문학",
+    "수원": "수원",
+    "대전": "대전",
+    "대구": "대구",
+    "광주": "광주",
+    "창원": "창원",
+    "울산": "울산",
+    "사직": "사직",
+    "포항": "포항"
+  };
+
+  function populateTeams() {
+    fetch('/api/teams').then(r=>r.json()).then(list=>{
+      const sel = document.getElementById('team-select');
+      sel.innerHTML = '';
+      list.forEach((t)=>{
+        const opt = document.createElement('option');
+        opt.value = t; opt.text = t;
+        sel.appendChild(opt);
+      });
+
+      if (!selectedTeam) selectedTeam = sel.options.length ? sel.options[0].value : 'LG';
+
+      // 드롭다운에 선택 반영
+      for (let i=0;i<sel.options.length;i++){
+        if (sel.options[i].value === selectedTeam) { sel.selectedIndex = i; break; }
+      }
+
+      sel.addEventListener('change', function(){
+        selectedTeam = this.value;
+        try { localStorage.setItem('kbo_selected_team', selectedTeam); } catch(e){}
+      });
+
+      // 팀 목록 준비가 끝나면 마커 생성(타이밍 문제 방지)
+      createMarkers();
+    }).catch(e=>{
+      const sel = document.getElementById('team-select');
+      if(sel && sel.options.length===0){
+        const opt = document.createElement('option');
+        opt.value = 'LG'; opt.text = 'LG'; sel.appendChild(opt);
+        selectedTeam = 'LG';
+      }
+      createMarkers();
+    });
+  }
+
+  // 마커 생성: 클릭 시 '현재 드롭다운 값' 사용 + 정식 구장명으로 라우팅
+  function createMarkers(){
+    const stadiums = [
+      { name: "잠실", team: "LG",   top: 140, left: 340 },
+      { name: "잠실", team: "두산", top: 165, left: 340 },
+      { name: "고척", team: "키움", top: 180, left: 310 },
+      { name: "문학", team: "SSG",  top: 200, left: 280 },
+      { name: "수원", team: "KT",   top: 225, left: 320 },
+      { name: "대전", team: "한화", top: 350, left: 390 },
+      { name: "대구", team: "삼성", top: 420, left: 490 },
+      { name: "광주", team: "KIA",  top: 510, left: 300 },
+      { name: "창원", team: "NC",   top: 500, left: 480 },
+      { name: "울산", team: "NC",   top: 520, left: 470 },
+      { name: "사직", team: "롯데", top: 510, left: 540 },
+      { name: "포항", team: "삼성", top: 430, left: 520 }
+    ];
+
+    const markersContainer = document.getElementById("markers");
+    markersContainer.innerHTML = ''; // 중복 방지
+    const getCurrentTeam = () => document.getElementById('team-select').value || 'LG';
+
+    stadiums.forEach(s => {
+      const marker = document.createElement("div");
+      marker.className = "team-marker";
+      marker.style.top = `${s.top}px`;
+      marker.style.left = `${s.left}px`;
+      marker.innerText = s.name;
+
+      marker.addEventListener('click', () => {
+        // 드롭다운이 비어있으면 마커의 team을 사용
+        const team = clean(getCurrentTeam() || s.team);
+        const display = clean(s.name);
+        const canonical = clean(STADIUM_ALIASES[display] || display); // 약칭 전송
+        const url = `/stadium/${encodeURIComponent(canonical)}/chart?team=${encodeURIComponent(team)}`;
+        console.debug("navigating to:", {display, canonical, team, url});
+        window.location.href = url;
+      });
+
+      markersContainer.appendChild(marker);
+    });
+  }
+
+  // 초기화
+  populateTeams();
+</script>
+</body>
+</html>
