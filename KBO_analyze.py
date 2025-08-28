@@ -1,5 +1,5 @@
 # KBO_analyze.py
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect, url_for
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
@@ -140,19 +140,22 @@ def map_view():
 
 @app.route("/stadium/<stadium>")
 def stadium_entrance(stadium):
+    # 기존: return render_template("Vis_ent.html", ...)
     selected_team = request.args.get('team', None)
+    # 구장 약칭 통일
     stadium = _canonicalize_stadium_input(stadium)
-    return render_template("Vis_ent.html", stadium=stadium, selected_team=selected_team)
+    # 바로 차트 페이지로 리다이렉트
+    return redirect(url_for('stadium_chart', stadium=stadium, team=selected_team))
 
 @app.route("/stadium/<stadium>/data")
 def stadium_data_overview(stadium):
+    # 기존: Vis_st.html 렌더 → JSON으로 교체
     selected_team = re.sub(r'\s+', '', (request.args.get('team') or ''))
     stadium = _canonicalize_stadium_input(stadium)
+
     df = load_latest_kbo_data()
     if df is None:
-        return render_template("Vis_st.html",
-                               stadium=stadium, selected_team=selected_team,
-                               games=[], error="데이터가 없습니다.", summary_card=None)
+        return jsonify({"error": "데이터가 없습니다.", "summary": None, "games": []}), 200
 
     mask_st = (df['stadium'] == stadium)
     team_games = df[((df['away_team'] == selected_team) | (df['home_team'] == selected_team)) & mask_st].copy()
@@ -181,10 +184,13 @@ def stadium_data_overview(stadium):
         '홈런': int(team_games['away_hr'][is_away].sum() + team_games['home_hr'][is_home].sum()),
     }
 
-    return render_template("Vis_st.html",
-                           stadium=stadium, selected_team=selected_team,
-                           games=team_games.to_dict('records'),
-                           summary_card=summary_card, error=None)
+    return jsonify({
+        "stadium": stadium,
+        "team": selected_team,
+        "summary": summary_card,
+        "games": team_games.sort_values("date", ascending=False).to_dict("records")
+    }), 200
+    
 
 @app.route("/api/teams")
 def get_teams():
