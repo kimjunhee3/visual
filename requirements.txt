@@ -1,1 +1,20 @@
-# video project
+Flask==3.0.3
+flask-cors==4.0.1
+gunicorn==21.2.0
+google-api-python-client==2.141.0
+google-auth==2.34.0
+google-auth-httplib2==0.2.0
+httplib2==0.22.0
+requests==2.32.3
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.8.4
+scipy==1.11.4
+scikit-learn==1.4.2
+joblib==1.3.2
+threadpoolctl==3.5.0
+lxml==4.9.3
+beautifulsoup4==4.12.3
+html5lib==1.1
+
+
