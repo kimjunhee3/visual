@@ -103,26 +103,31 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def load_latest_kbo_data():
     global kbo_data_cache
-    if kbo_data_cache is not None:
-        return kbo_data_cache
     try:
-        preferred_file = "kbo_games_ultra_precise_20250828_020405.csv"
-        preferred_file = r"C:\Users\82102\Desktop\캡디\커서\.vscode\csv_backup\kbo_games_ultra_precise_20250828_003137.csv"
-        if os.path.exists(preferred_file):
-             kbo_data_cache = pd.read_csv(preferred_file, encoding='utf-8-sig')
-             kbo_data_cache = _post_load_normalize(kbo_data_cache)
-             return kbo_data_cache
-
+        # 우선 환경변수로 지정된 파일 사용
+        preferred_file = os.getenv("KBO_PREFERRED_CSV")
+        # 이전에 윈도우 경로로 하드코딩해둔 부분 제거
+        # preferred_file = r"C:\Users\82102\Desktop\캡디\커서\.vscode\csv_backup\kbo_games_ultra_precise_20250828_003137.csv"
+        candidates = []
+        if preferred_file:
+            candidates.append(preferred_file)
         csv_files = [f for f in os.listdir('.') if f.startswith('kbo_games_') and f.endswith('.csv')]
-        if not csv_files:
-            return None
         csv_files.sort(reverse=True)
-        latest = csv_files[0]
-        kbo_data_cache = pd.read_csv(latest, encoding='utf-8-sig')
+        candidates.extend(csv_files)
+
+        used = None
+        for c in candidates:
+            if os.path.exists(c):
+                used = c
+                break
+        if not used:
+            return None
+        kbo_data_cache = pd.read_csv(used, encoding='utf-8-sig')
         kbo_data_cache = _post_load_normalize(kbo_data_cache)
         return kbo_data_cache
     except Exception as e:
-        print("데이터 로드 오류:", e)
+        import logging
+        logging.exception("데이터 로드 오류")
         return None
 
 def clear_kbo_data_cache():
@@ -506,4 +511,11 @@ def _health():
     return "ok", 200
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5004)
+    # 배포 전에는 이 호출로만 백업/정리 실행 (import 시 실행되면 안됨)
+    try:
+        keep_latest_kbo_csv()
+    except Exception:
+        pass
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() in ("1","true","yes")
+    port = int(os.getenv("PORT", "5004"))
+    app.run(debug=debug_mode, port=port)
