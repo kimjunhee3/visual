@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ stadium }} 구장 - {{ selected_team }} 성적</title>
+  <script src="https://cdn.plot.ly/plotly-2.31.1.min.js"></script>
+  <style>
+    :root{
+      --container: 980px;
+      --card-bg: rgba(255,255,255,0.95);
+      --shadow: none; 
+      --radius: 16px;
+      --team-color: #ffd700;     /* 더 선명한 팀 색 */
+      --stadium-color: #3884ff;
+    }
+
+    body{
+      background: url('/static/baseball-4359434_1280.jpg') center/cover no-repeat fixed;
+      margin:0; min-height:100vh;
+      font-family:'Noto Sans KR', system-ui, Arial, sans-serif;
+      color:#222; position:relative;
+    }
+    body::before{ content:""; position:fixed; inset:0; background: rgba(0,0,0,.25); pointer-events:none; }
+
+    .section{ width: min(100%, var(--container)); margin: 0 auto; }
+    .page{ padding: clamp(12px, 2vw, 22px); }
+
+    .header{ text-align:center; color:#fff; text-shadow:0 3px 12px rgba(0,0,0,.45); }
+    .header h1{ margin:0 0 6px; font-weight:800; font-size: clamp(28px, 4vw, 52px); }
+    .header .sub{ font-size: clamp(16px, 2vw, 20px); opacity:.95; }
+    .header .team-name{ color: var(--team-color); }
+    .header .stadium-name{ color: var(--stadium-color); }
+    .header .sep{ color:#fff; opacity:.9; }
+    .header .sub{ display:none !important; }
+
+    .card{
+      position: relative; z-index:0;
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: saturate(110%) blur(2px);
+      padding: clamp(14px, 1.6vw, 20px);
+      margin-top: clamp(14px, 1.6vw, 18px);
+    }
+    .chart-title{ color:#0f3460; font-weight:800; margin: 2px 4px 8px; font-size: clamp(24px, 3vw, 30px); }
+    #chart{ width:100%; height: clamp(420px, 52vw, 540px); }
+
+    .summary-card{ text-align:center; margin-top: clamp(18px, 1.8vw, 24px) !important; }
+    .summary-card h2{ color:#eab308;; font-size: clamp(24px, 2.6vw, 30px);  margin:0 0 12px; font-weight:800; }
+    .summary-table{ width:100%; border-collapse:collapse; margin-bottom:10px; }
+    .summary-table td{ padding: clamp(8px, 1.2vw, 12px); font-size: clamp(20px, 2.2vw, 26px); font-weight:700; line-height: 1.25;
+      white-space: nowrap; }
+    .summary-table tr:first-child td { 
+      font-size: clamp(20px, 2.4vw, 28px);    /* "경기수, 승, 패, 무" 라벨 */
+    }
+    .summary-table tr:nth-child(2) td,
+    .summary-table tr:nth-child(4) td{
+      font-size: clamp(22px, 2.8vw, 32px); /* 숫자 강조 */
+      font-weight: 800;
+    }
+    .win{ color:#16a34a; } .lose{ color:#ef4444; } .draw{ color:#666; }
+    .detail-btn{
+      font-size: clamp(18px, 1.8vw, 20px);
+      padding: clamp(8px, 1vw, 10px) clamp(16px, 1.8vw, 22px);
+      border-radius:10px; border:none; cursor:pointer;
+      background:#ffd700; color:#0f3460; font-weight:800;
+    }
+    .detail-btn:hover{ background:#ffb300; }
+
+    .detail-table-container{ display:none; margin-top: clamp(28px, 2vw, 36px) !important; }
+    .detail-table-container.active{ display:block; }
+    .detail-table{ width:100%; border-collapse:collapse; }
+    .detail-table th,.detail-table td{
+      padding: clamp(8px,1.2vw,14px);
+      border-bottom:1px solid #eee; text-align:center;
+      font-size: clamp(20px, 1.8vw, 22px);
+      line-height: 1.35;
+    }
+    .detail-table th{ background:#f7f7f7; color:#0f3460; font-weight:800; }
+
+    /* 연속 카드 기본 간격 유지 */
+    .section.card + .section.card{ margin-top: clamp(16px, 1.6vw, 22px) !important; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header section">
+      <h1>
+        <span class="stadium-name">{{ stadium }}</span>
+        <span class="sep"> 구장 - </span>
+        <span class="team-name">{{ selected_team }}</span>
+        <span class="sep"> 성적</span>
+      </h1>
+      <div class="sub">최근 경기 데이터</div>
+    </div>
+
+    <!-- 차트 카드 -->
+    <div class="section card">
+      <div class="chart-title">{{ selected_team }} VS {{ stadium }} 리그 평균</div>
+      <div id="chart"
+     data-stadium='{{ (stadium_data or [])|tojson|safe }}'
+     data-stadium-others='{{ (stadium_others or [])|tojson|safe }}'
+     data-teamgames='{{ summary_card["경기수"]|int }}'
+     data-othersgames='{{ others_apps_count|default(0)|int }}'
+     data-othersteamcount='{{ others_team_count|default(0)|int }}' 
+     data-name='{{ selected_team }}'
+     data-stadiumname='{{ stadium }}'></div>
+    </div> 
+
+    <!-- 요약 카드 -->
+    <div class="section card summary-card">
+      <h2>종합 성적</h2>
+      <table class="summary-table">
+        <tr><td>경기수</td><td class="win">승</td><td class="lose">패</td><td class="draw">무</td></tr>
+        <tr>
+          <td>{{ summary_card['경기수'] }}</td>
+          <td class="win">{{ summary_card['승'] }}</td>
+          <td class="lose">{{ summary_card['패'] }}</td>
+          <td class="draw">{{ summary_card['무'] }}</td>
+        </tr>
+        <tr><td>득점</td><td>실점</td><td>안타</td><td>홈런</td></tr>
+        <tr>
+          <td>{{ summary_card['득점'] }}</td>
+          <td>{{ summary_card['실점'] }}</td>
+          <td>{{ summary_card['안타'] }}</td>
+          <td>{{ summary_card['홈런'] }}</td>
+        </tr>
+      </table>
+      <button class="detail-btn" onclick="toggleDetail()">자세히 보기</button>
+    </div>
+
+    <!-- 상세 표 -->
+    <div id="detail-table-container" class="section card detail-table-container">
+      <table class="detail-table">
+        <tr>
+          <th>날짜</th><th>홈팀</th><th>원정팀</th>
+          <th>홈점수</th><th>원정점수</th>
+          <th>홈안타</th><th>원정안타</th>
+          <th>홈런</th><th>결과</th>
+        </tr>
+        {% for g in games %}
+        <tr>
+          <td>{{ g['date'] }}</td>
+          <td>{{ g['home_team'] }}</td>
+          <td>{{ g['away_team'] }}</td>
+          <td>{{ g['home_score'] }}</td>
+          <td>{{ g['away_score'] }}</td>
+          <td>{{ g['home_hit'] }}</td>
+          <td>{{ g['away_hit'] }}</td>
+          <td>{{ g['home_hr'] + g['away_hr'] }}</td>
+          <td>{% if g['home_team'] == selected_team %}{{ g['home_result'] }}{% else %}{{ g['away_result'] }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const el = document.getElementById('chart');
+      if (!el) return;
+    
+      const teamName    = el.dataset.name || '';
+      const stadiumName = el.dataset.stadiumname || '';
+    
+      let stadium = [], stadiumOthers = [];
+      try { stadium       = JSON.parse(el.dataset.stadium       || '[]'); } catch(e){}
+      try { stadiumOthers = JSON.parse(el.dataset.stadiumOthers || '[]'); } catch(e){}
+    
+      const teamGames        = Number(el.dataset.teamgames || 0);
+      const othersGames      = Number(el.dataset.othersgames || 0);        // 다른팀 '출전수'(appearance 수)
+      const othersTeamCount  = Number(el.dataset.othersteamcount || 0);    // 다른팀 '구단 수'
+    
+      const categories = ['안타', '홈런', '타율'];
+      const toNum = (a) => (Array.isArray(a) ? a.map(v => (isNaN(Number(v)) ? 0 : Number(v))) : []);
+      const T_raw = toNum(stadium);        // [H/G, HR/G, AVG]
+      const O_raw = toNum(stadiumOthers);  // [H/G, HR/G, AVG]
+    
+      const n = Math.max(categories.length, O_raw.length, T_raw.length);
+      while (O_raw.length < n) O_raw.push(0);
+      while (T_raw.length < n) T_raw.push(0);
+    
+      // 안타 정규화 (두 시리즈 중 최대 = 1)
+      const hitMax = Math.max(O_raw[0] || 0, T_raw[0] || 0, 1e-9);
+      const O = [ O_raw[0] / hitMax, O_raw[1], O_raw[2] ];
+      const T = [ T_raw[0] / hitMax, T_raw[1], T_raw[2] ];
+    
+      // 포맷터
+      const fmt = (v, d=2) => (isFinite(v) ? Number(v).toFixed(d) : '-');
+      const fmt3 = (v) => (isFinite(v) ? Number(v).toFixed(3) : '-');
+      const fmtInt = (v) => (isFinite(v) ? Math.round(v).toString() : '-');
+    
+      // 리그 평균(=다른팀) 총 HR과 '리그 평균 갯수' 계산
+      const others_total_hr = O_raw[1] * (othersGames || 0);                          // per-appearance * appearances
+      const hr_league_avg_count = (othersTeamCount ? (others_total_hr / othersTeamCount) : 0);
+    
+      // hover 텍스트
+      const hoverOthers = [
+        `안타(정규화): ${fmt(O[0],2)}<br>안타(게임 당): ${fmt(O_raw[0],2)}`,
+        `홈런(리그 평균 갯수): ${fmt(hr_league_avg_count,2)}개`
+        + `<br>홈런(게임 당 리그 평균): ${fmt(O_raw[1],2)}`,
+        `타율: ${fmt3(O_raw[2])}`
+      ];
+    
+      const team_total_hr = T_raw[1] * (teamGames || 0);
+      const hoverTeam = [
+        `안타(정규화): ${fmt(T[0],2)}<br>안타(게임 당): ${fmt(T_raw[0],2)}`,
+        `홈런(전체): ${fmtInt(team_total_hr)}개`
+        + `<br>홈런(게임 당): ${fmt(T_raw[1],2)}`,
+        `타율: ${fmt3(T_raw[2])}`
+      ];
+    
+      const trOthers = {
+        type: 'bar',
+        name: '리그 평균',                 // 범례명
+        x: categories, y: O,
+        hovertext: hoverOthers,
+        hovertemplate: '%{hovertext}<extra></extra>',
+        marker: { color: '#5B7DB3' },
+        offsetgroup: 'st'
+      };
+    
+      const trTeam = {
+        type: 'bar',
+        name: `${teamName} @ ${stadiumName}`,
+        x: categories, y: T,
+        hovertext: hoverTeam,
+        hovertemplate: '%{hovertext}<extra></extra>',
+        marker: { color: '#FFD166' },
+        offsetgroup: 'tm'
+      };
+    
+      const layout = {
+       barmode: 'group',
+       bargroupgap: 0.06,
+       bargap: 0.42,
+       yaxis: { 
+         rangemode: 'tozero', 
+         range: [0, 1], 
+         dtick: 0.1,
+         tickfont: { size: 16 }
+       },
+       xaxis: {
+         tickfont: { size: 18 }
+       },
+       legend: { 
+         orientation: 'h', 
+         x: 0, y: 1.08,
+         font: { size: 18 }
+       },
+       margin: { t: 24, r: 16, b: 48, l: 48 },
+
+  // 👇 hover 라벨 스타일
+       hoverlabel: {
+         font: { color: 'white', size: 20 },  // 글씨 흰색
+         bgcolor: '#222831',                  // 배경 어두운색 (원하는 색으로 변경 가능)
+         bordercolor: '#444'                  // 테두리색
+       }
+      };
+    
+      Plotly.newPlot('chart', [trOthers, trTeam], layout, {responsive:true, displaylogo:false});
+    })();
+    window.toggleDetail = function () {
+      const c = document.getElementById('detail-table-container');
+      if (!c) return;
+      c.classList.toggle('active');
+      if (c.classList.contains('active')) {
+        c.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    };
+    </script>
+    
+</body>
+</html>
