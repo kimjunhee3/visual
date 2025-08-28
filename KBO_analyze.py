@@ -500,7 +500,10 @@ def _debug_raw_stadium_search():
     except Exception as e:
         return jsonify({"error":"read failed", "exc": str(e), **info})
     return jsonify(info)
-
+    
+@app.get("/healthz")
+def _health():
+    return "ok", 200
 
 if __name__ == "__main__":
     app.run(debug=True, port=5004)
