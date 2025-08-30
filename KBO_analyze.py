@@ -6,12 +6,96 @@ import numpy as np
 import os
 import shutil
 import re
+import requests
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
 
 # =========================
-# 파일 관리 / 캐시
+# 원격 CSV 설정 & 캐시 파일
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_CSV = os.path.join(BASE_DIR, "data", "kbo_latest.csv")  # 항상 이 파일을 우선 읽음
+CACHE_DIR = os.path.join(BASE_DIR, "static", "cache")
+os.makedirs(os.path.dirname(LOCAL_CSV), exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+REMOTE_CSV_URL = os.getenv("KBO_CSV_URL", "").strip()  # 깃허브 raw CSV 주소
+CSV_MAX_AGE_MIN = int(os.getenv("CSV_MAX_AGE_MIN", "5"))  # 방문 간 최소 확인 주기(분)
+FILTER_SCHEDULED = os.getenv("FILTER_SCHEDULED", "0").lower() in ("1", "true", "yes")
+
+ETAG_PATH = os.path.join(CACHE_DIR, "kbo_csv.etag")
+MTIME_PATH = os.path.join(CACHE_DIR, "kbo_csv.mtime")
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except:
+        return ""
+
+def _write_text(path, txt):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+
+def _need_refresh():
+    """마지막 확인 후 CSV_MAX_AGE_MIN분 지났는지."""
+    try:
+        last = _read_text(MTIME_PATH)
+        if not last:
+            return True
+        last_dt = datetime.fromisoformat(last)
+        return (datetime.now() - last_dt) >= timedelta(minutes=CSV_MAX_AGE_MIN)
+    except:
+        return True
+
+def ensure_latest_csv(force=False):
+    """
+    방문 시 호출: 원격 CSV가 바뀌었으면 로컬(data/kbo_latest.csv)로 저장하고
+    메모리 캐시 무효화.
+    """
+    global kbo_data_cache
+    if not REMOTE_CSV_URL:
+        return False
+    if not force and not _need_refresh():
+        return False
+
+    headers = {}
+    etag = _read_text(ETAG_PATH)
+    if etag:
+        headers["If-None-Match"] = etag
+
+    try:
+        r = requests.get(REMOTE_CSV_URL, headers=headers, timeout=15)
+        if r.status_code == 304:
+            _write_text(MTIME_PATH, datetime.now().isoformat())
+            return False
+
+        r.raise_for_status()
+        with open(LOCAL_CSV, "wb") as f:
+            f.write(r.content)
+
+        new_etag = r.headers.get("ETag", "").strip()
+        if new_etag:
+            _write_text(ETAG_PATH, new_etag)
+
+        _write_text(MTIME_PATH, datetime.now().isoformat())
+        clear_kbo_data_cache()
+        return True
+    except Exception:
+        # 원격 실패 시 조용히 무시(기존 파일로 계속 서비스)
+        return False
+
+@app.before_request
+def _lazy_refresh():
+    try:
+        ensure_latest_csv()
+    except Exception:
+        pass
+
+# =========================
+# 파일 관리 / 캐시(로컬 보조)
 # =========================
 def keep_latest_kbo_csv(backup_dir="csv_backup"):
     os.makedirs(backup_dir, exist_ok=True)
@@ -21,11 +105,18 @@ def keep_latest_kbo_csv(backup_dir="csv_backup"):
     csv_files.sort(reverse=True)
     latest = csv_files[0]
     for f in csv_files[1:]:
-        shutil.move(f, os.path.join(backup_dir, f))
+        try:
+            shutil.move(f, os.path.join(backup_dir, f))
+        except Exception:
+            pass
     print(f"최신 파일만 남기고 {len(csv_files)-1}개 백업 완료: {latest}")
 
-# 서버 시작 전에 한 번만 호출
-keep_latest_kbo_csv()
+# 서버 시작 시 1회(로컬 개발 편의)
+try:
+    keep_latest_kbo_csv()
+except Exception:
+    pass
+
 kbo_data_cache = None
 
 # =========================
@@ -96,18 +187,37 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
     for c in NUM_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
+
+    # (선택) 예정 경기 숨기기: 환경변수 FILTER_SCHEDULED=1 이면 제거
+    if FILTER_SCHEDULED and {'away_result','home_result'}.issubset(df.columns):
+        df = df[~((df['away_result']=='예정') & (df['home_result']=='예정'))].copy()
+
+    # 날짜 문자열 표준화
+    if 'date' in df.columns:
+        try:
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+
     return df
 
 # =========================
-# 데이터 로드
+# 데이터 로드 (항상 LOCAL_CSV 우선)
 # =========================
 def load_latest_kbo_data():
     global kbo_data_cache
     try:
-        # 우선 환경변수로 지정된 파일 사용
+        if kbo_data_cache is not None:
+            return kbo_data_cache
+
+        # 1순위: 고정 로컬 파일 (ensure_latest_csv가 갱신)
+        if os.path.exists(LOCAL_CSV):
+            kbo_data_cache = pd.read_csv(LOCAL_CSV, encoding='utf-8-sig')
+            kbo_data_cache = _post_load_normalize(kbo_data_cache)
+            return kbo_data_cache
+
+        # 2순위: 로컬에 남아있는 최신 kbo_games_*.csv
         preferred_file = os.getenv("KBO_PREFERRED_CSV")
-        # 이전에 윈도우 경로로 하드코딩해둔 부분 제거
-        # preferred_file = r"C:\Users\82102\Desktop\캡디\커서\.vscode\csv_backup\kbo_games_ultra_precise_20250828_003137.csv"
         candidates = []
         if preferred_file:
             candidates.append(preferred_file)
@@ -122,6 +232,7 @@ def load_latest_kbo_data():
                 break
         if not used:
             return None
+
         kbo_data_cache = pd.read_csv(used, encoding='utf-8-sig')
         kbo_data_cache = _post_load_normalize(kbo_data_cache)
         return kbo_data_cache
@@ -145,16 +256,12 @@ def map_view():
 
 @app.route("/stadium/<stadium>")
 def stadium_entrance(stadium):
-    # 기존: return render_template("Vis_ent.html", ...)
     selected_team = request.args.get('team', None)
-    # 구장 약칭 통일
     stadium = _canonicalize_stadium_input(stadium)
-    # 바로 차트 페이지로 리다이렉트
     return redirect(url_for('stadium_chart', stadium=stadium, team=selected_team))
 
 @app.route("/stadium/<stadium>/data")
 def stadium_data_overview(stadium):
-    # 기존: Vis_st.html 렌더 → JSON으로 교체
     selected_team = re.sub(r'\s+', '', (request.args.get('team') or ''))
     stadium = _canonicalize_stadium_input(stadium)
 
@@ -195,7 +302,6 @@ def stadium_data_overview(stadium):
         "summary": summary_card,
         "games": team_games.sort_values("date", ascending=False).to_dict("records")
     }), 200
-    
 
 @app.route("/api/teams")
 def get_teams():
@@ -262,8 +368,6 @@ def stadium_summary_api():
     losses = res_list.count('패')
     draws = res_list.count('무')
 
-
-
     summary_card = {
         '경기수': int(finished_mask.sum()),
         '승': wins,
@@ -282,14 +386,12 @@ def stadium_summary_api():
 # =========================
 @app.route("/stadium/<stadium>/chart")
 def stadium_chart(stadium):
-    # 안전 초기값
     league_arr = [0.0, 0.0, 0.0]
     stadium_arr = [0.0, 0.0, 0.0]
     stadium_others_arr = [0.0, 0.0, 0.0]
     games = []
     summary_card = {'경기수':0,'승':0,'패':0,'무':0,'득점':0,'실점':0,'안타':0,'홈런':0}
 
-    # 입력 정리
     try:
         stadium = _canonicalize_stadium_input(stadium)
     except Exception:
@@ -310,24 +412,19 @@ def stadium_chart(stadium):
             error="데이터가 없거나 팀이 지정되지 않았습니다."
         )
 
-    # (1) 선택팀 @ 구장 경기들
     mask_st = (df['stadium'] == stadium)
     team_games = df[
         ((df['away_team'] == selected_team) | (df['home_team'] == selected_team)) & mask_st
     ].copy()
 
-    # 홈/원정 플래그
     is_away = (team_games['away_team'] == selected_team)
     is_home = (team_games['home_team'] == selected_team)
 
-    # '예정' 경기 제외 마스크 (우리 팀 입장에서의 결과 기준)
     team_result = np.where(is_home, team_games['home_result'], team_games['away_result']).astype(str)
     finished_mask = (team_result != '예정')
 
-    # 유효 경기수(G): 예정 제외
     G = int(finished_mask.sum())
 
-    # 합계(예정 제외) 계산
     team_hit = int(
         team_games.loc[is_away & finished_mask, 'away_hit'].sum()
       + team_games.loc[is_home  & finished_mask, 'home_hit'].sum()
@@ -345,14 +442,12 @@ def stadium_chart(stadium):
 
     team_avg = round(team_hit / team_ab, 4) if team_ab else 0.0
 
-    # 구장에서의 우리 팀 per-game 지표 (예정 제외)
     stadium_arr = [
-        round(team_hit / G, 4) if G else 0.0,   # 안타/G
-        round(team_hr  / G, 4) if G else 0.0,   # HR/G
-        team_avg                                 # 타율
+        round(team_hit / G, 4) if G else 0.0,
+        round(team_hr  / G, 4) if G else 0.0,
+        team_avg
     ]
 
-    # (2) 리그 전체 평균(우리 팀 제외, '예정' 제외) — 필요 시 사용
     rows = []
     for _, r in df.iterrows():
         rows.append({"team": r.get('away_team',''), "H": int(r.get('away_hit',0)),
@@ -374,7 +469,6 @@ def stadium_chart(stadium):
             round(H_sum / AB_sum, 4) if AB_sum else 0.0
         ]
 
-    # (3) 같은 구장에서의 다른 팀 평균 (우리 팀 제외, '예정' 제외)
     rows_st = []
     for _, r in df[mask_st].iterrows():
         rows_st.append({"team": r.get('away_team',''), "H": int(r.get('away_hit',0)),
@@ -401,10 +495,8 @@ def stadium_chart(stadium):
         apps_st = 0
         others_team_count = 0
 
-    # (4) summary + games
     games = team_games.sort_values("date", ascending=False).to_dict(orient="records") if not team_games.empty else []
 
-    # 승/패/무(예정 제외)
     res_list = []
     res_list.extend(team_games.loc[is_home & finished_mask, 'home_result'].tolist())
     res_list.extend(team_games.loc[is_away & finished_mask, 'away_result'].tolist())
@@ -432,13 +524,12 @@ def stadium_chart(stadium):
         games=games,
         summary_card=summary_card,
         error=None,
-        # 타팀 메타(hover 계산용)
         others_apps_count=apps_st,
         others_team_count=others_team_count
     )
 
 # =========================
-# 디버그
+# 디버그 & 관리
 # =========================
 @app.route("/_debug/count")
 def _debug_count():
@@ -448,12 +539,10 @@ def _debug_count():
     if df is None:
         return jsonify({"msg":"no data"})
 
-    # 팀 + 구장 필터
     sub = df[(((df['away_team']==t) | (df['home_team']==t)) & (df['stadium']==s))].copy()
     if sub.empty:
         return jsonify({"team": t, "stadium": s, "rows": 0})
 
-    # 우리 팀 입장에서 '예정' 제외
     is_home = (sub['home_team'] == t)
     team_result = np.where(is_home, sub['home_result'], sub['away_result']).astype(str)
     finished_mask = (team_result != '예정')
@@ -467,10 +556,8 @@ def _debug_team_stadiums():
     df = load_latest_kbo_data()
     if df is None:
         return jsonify({"error":"no data"})
-    # 팀이 등장한 행(홈 또는 원정)
     mask = (df['away_team'] == t) | (df['home_team'] == t)
     sub = df[mask].copy()
-    
     counts = sub['stadium'].value_counts().to_dict()
     sample = sub.head(20).to_dict(orient='records')
     return jsonify({"team": t, "total_rows": int(sub.shape[0]), "by_stadium":counts,"sample": sample})
@@ -478,11 +565,11 @@ def _debug_team_stadiums():
 @app.route("/_debug/raw_stadium_search")
 def _debug_raw_stadium_search():
     q = (request.args.get("query") or "").strip()
-    # which file was loaded
-    pref = "kbo_games_ultra_precise_20250828_020405.csv"
-    csv_files = [f for f in os.listdir('.') if f.startswith('kbo_games_') and f.endswith('.csv')]
-    csv_files.sort(reverse=True)
-    used = pref if os.path.exists(pref) else (csv_files[0] if csv_files else None)
+    used = LOCAL_CSV if os.path.exists(LOCAL_CSV) else None
+    if not used:
+        csv_files = [f for f in os.listdir('.') if f.startswith('kbo_games_') and f.endswith('.csv')]
+        csv_files.sort(reverse=True)
+        used = (csv_files[0] if csv_files else None)
     info = {"used_file": used, "query": q, "matches": []}
     if not used:
         return jsonify({"error":"no csv found", **info})
@@ -493,29 +580,35 @@ def _debug_raw_stadium_search():
             i = 0
             for row in reader:
                 i += 1
-                # raw stadium cell
                 stad = row.get('stadium') or row.get('Stadium') or ''
-                # also check full concatenated row text
                 full = "|".join([str(v) for v in row.values()])
                 if q and (q in stad or q in full):
-                    info["matches"].append({"row": i, "stadium_raw": stad, "away_team": row.get('away_team'), "home_team": row.get('home_team'), "date": row.get('date'), "full": full})
+                    info["matches"].append({
+                        "row": i, "stadium_raw": stad,
+                        "away_team": row.get('away_team'),
+                        "home_team": row.get('home_team'),
+                        "date": row.get('date')
+                    })
                 if len(info["matches"]) >= 50:
                     break
         info["checked_rows"] = i
     except Exception as e:
         return jsonify({"error":"read failed", "exc": str(e), **info})
     return jsonify(info)
-    
+
+@app.get("/admin/refresh")
+def _admin_refresh():
+    token = request.args.get("token", "")
+    if not token or token != os.getenv("REFRESH_TOKEN", ""):
+        return "unauthorized", 401
+    changed = ensure_latest_csv(force=True)
+    return jsonify({"updated": bool(changed)}), 200
+
 @app.get("/healthz")
 def _health():
     return "ok", 200
 
 if __name__ == "__main__":
-    # 배포 전에는 이 호출로만 백업/정리 실행 (import 시 실행되면 안됨)
-    try:
-        keep_latest_kbo_csv()
-    except Exception:
-        pass
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() in ("1","true","yes")
     port = int(os.getenv("PORT", "5004"))
     app.run(debug=debug_mode, port=port)
