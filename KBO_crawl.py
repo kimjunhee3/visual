@@ -433,11 +433,11 @@ class UltraPreciseKBOCrawler:
 
 def get_dates_to_crawl_from_last_update(last_update_path=None, since=None, force_default=False):
     """
-    last_update_path: optional, 기본은 script/static/cache/last_update.json (절대경로 보장)
-    since: YYYYMMDD 형식으로 강제 시작일 지정 (없으면 last_update 또는 DEFAULT_SINCE 사용)
-    force_default: True면 last_update 무시하고 DEFAULT_SINCE부터 시작
+    last_update_path: 기본값은 <repo>/static/cache/last_update.json
+    since: 'YYYYMMDD'로 주면 그 날짜부터 강제 시작
+    force_default: True면 last_update/CSV 무시하고 DEFAULT_SINCE부터 시작
     """
-    # 기본 경로 절대화
+    # 절대경로 보장
     base = os.path.dirname(os.path.abspath(__file__))
     if last_update_path is None:
         last_update_path = os.path.join(base, "static", "cache", "last_update.json")
@@ -445,7 +445,7 @@ def get_dates_to_crawl_from_last_update(last_update_path=None, since=None, force
         if not os.path.isabs(last_update_path):
             last_update_path = os.path.join(base, last_update_path)
 
-    # since가 주어지면 그 날짜부터
+    # 1) since가 주어지면 그 날짜부터
     if since:
         try:
             start_dt = datetime.strptime(since, "%Y%m%d").date()
@@ -453,20 +453,41 @@ def get_dates_to_crawl_from_last_update(last_update_path=None, since=None, force
             raise ValueError("since는 YYYYMMDD 형식이어야 합니다.")
     else:
         if force_default:
+            # 2) 강제로 기본 시작일
             start_dt = datetime.strptime(DEFAULT_SINCE, "%Y%m%d").date()
         else:
-            # last_update.json이 있으면 그다음 날부터, 없거나 파싱 실패면 DEFAULT_SINCE 사용
+            # 3) last_update.json이 있으면 그 다음 날부터
             if os.path.exists(last_update_path):
                 try:
                     with open(last_update_path, encoding="utf-8") as f:
                         last_update = json.load(f)
-                    last_dt = datetime.strptime(last_update.get("ts", ""), "%Y-%m-%d %H:%M:%S").date() + timedelta(days=1)
-                    start_dt = last_dt
+                    # 형식: "YYYY-MM-DD HH:MM:SS"
+                    last_dt = datetime.strptime(last_update.get("ts", ""), "%Y-%m-%d %H:%M:%S").date()
+                    start_dt = last_dt + timedelta(days=1)
                 except Exception:
-                    start_dt = datetime.strptime(DEFAULT_SINCE, "%Y%m%d").date()
+                    start_dt = None
             else:
+                start_dt = None
+
+            # 4) last_update가 없거나 파싱 실패 시, data/kbo_latest.csv에서 마지막 날짜+1
+            if start_dt is None:
+                data_csv = os.path.join(base, "data", "kbo_latest.csv")
+                if os.path.exists(data_csv):
+                    try:
+                        df_prev = pd.read_csv(data_csv, encoding="utf-8-sig")
+                        if "date" in df_prev.columns and not df_prev.empty:
+                            s = pd.to_datetime(df_prev["date"], errors="coerce")
+                            last = s.max()
+                            if pd.notna(last):
+                                start_dt = (last + timedelta(days=1)).date()
+                    except Exception:
+                        start_dt = None
+
+            # 5) 그래도 못 정하면 DEFAULT_SINCE
+            if start_dt is None:
                 start_dt = datetime.strptime(DEFAULT_SINCE, "%Y%m%d").date()
 
+    # 6) start_dt ~ 오늘까지 날짜 리스트(YYYYMMDD) 생성
     today = datetime.today().date()
     dates = []
     d = start_dt
@@ -475,18 +496,18 @@ def get_dates_to_crawl_from_last_update(last_update_path=None, since=None, force
         d += timedelta(days=1)
     return dates
 
+
 # ========= 메인 =========
 
 def main():
     print("초정밀 KBO 크롤링 시작")
-
-    # force_default=True로 설정하면 항상 DEFAULT_SINCE부터 시작합니다.
+    # ⬇️ 증분 시작: last_update.json(있으면) 또는 data/kbo_latest.csv의 마지막 날짜+1
     dates_to_crawl = get_dates_to_crawl_from_last_update("static/cache/last_update.json", force_default=False)
     if not dates_to_crawl:
         print("새로 크롤링할 경기가 없습니다.")
         return
-
     print("신규 경기 날짜:", dates_to_crawl)
+    
     crawler = UltraPreciseKBOCrawler()
     try:
         results = crawler.crawl_kbo_games(dates_to_crawl, force_refresh=True)
