@@ -3,8 +3,7 @@ name: Update KBO CSV daily
 on:
   workflow_dispatch: {}
   schedule:
-    # 매일 00:10 KST (UTC+9) = 15:10 UTC
-    - cron: "40 14 * * *"
+    - cron: "40 14 * * *"   # 매일 23:40 KST (UTC+9)
 
 permissions:
   contents: write
@@ -32,7 +31,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # requirements에 빠졌을 경우 대비
+          # 만약 requirements에 빠져 있으면 대비
           pip install selenium beautifulsoup4 pandas numpy requests
 
       - name: Run crawler (headless)
