@@ -481,7 +481,7 @@ def main():
     print("초정밀 KBO 크롤링 시작")
 
     # force_default=True로 설정하면 항상 DEFAULT_SINCE부터 시작합니다.
-    dates_to_crawl = get_dates_to_crawl_from_last_update("static/cache/last_update.json", force_default=True)
+    dates_to_crawl = get_dates_to_crawl_from_last_update("static/cache/last_update.json", force_default=False)
     if not dates_to_crawl:
         print("새로 크롤링할 경기가 없습니다.")
         return
