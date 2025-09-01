@@ -3,8 +3,10 @@ name: Update KBO CSV daily
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "40 14 * * *"   # 매일 23:40 KST (UTC+9)
-    - cron: "10 16 * * *"
+    - cron: "40 16 * * *"   # 매일 01:40 KST
+    - cron: "30 18 * * *"   # 매일 03:30 KST
+    - cron: "10 21 * * *"   # 매일 06:10 KST
+    
 permissions:
   contents: write
 
