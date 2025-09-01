@@ -4,10 +4,9 @@
 # -----------------------------------------
 import os
 import re
-import csv
 import sys
 import time
-import json
+import csv
 import argparse
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
@@ -26,14 +25,13 @@ REVIEW_URL   = "https://www.koreabaseball.com/GameCenter/Main.aspx?gameId={gid}&
 
 DEFAULT_SINCE = "20250322"  # 첫 수집 시작일(YYYYMMDD)
 WAIT_SEC = 12               # 페이지 로드 대기 (네트워크 상황 따라 조정)
-
 SKIP_KEYWORDS = ("예정", "취소", "우천", "노게임")
+
+GAMEID_RE = re.compile(r'gameId[=:\'"]?(\d{8})')
 
 # -----------------------------
 # 유틸
 # -----------------------------
-GAMEID_RE = re.compile(r'gameId[=:\'"]?(\d{8})')
-
 def yyyymmdd(d: date) -> str:
     return d.strftime("%Y%m%d")
 
@@ -50,6 +48,11 @@ def safe_int(s: str, default: int = 0) -> int:
         return int(re.sub(r"[^\d]", "", s))
     except Exception:
         return default
+
+def ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 # -----------------------------
 # Selenium setup
@@ -69,51 +72,35 @@ def make_driver() -> webdriver.Chrome:
     return driver
 
 # -----------------------------
-# 스케줄 페이지에서 특정 날짜로 이동
-#   - 공식 페이지는 캘린더 위젯으로 날짜 전환
-#   - 가장 안정적인 방법: 자바스크립트로 달력 이동 이벤트 트리거
+# 스케줄 페이지 로드 (날짜 직접 조작은 불안정 → 필터로 보정)
 # -----------------------------
 def goto_schedule_date(driver: webdriver.Chrome, d: date) -> None:
     driver.get(SCHEDULE_URL)
-    # 캘린더/테이블 로드 대기
     WebDriverWait(driver, WAIT_SEC).until(
         EC.presence_of_all_elements_located((By.CSS_SELECTOR, "body"))
     )
-    # 달력 위젯은 내부적으로 ajax로 테이블을 갱신한다.
-    # 날짜 셀렉터나 캘린더 인풋(id가 바뀔 수 있어 방어적으로 처리).
-    # 페이지 스크립트에 의존하지 않고, 서버가 뿌려주는 a[href*=gameId]에서 직접 수집하는 전략도 함께 사용.
-    time.sleep(2)  # 초기 스크립트/캘린더 부팅 여유
-
-    # 일부 환경에서 같은 날짜가 기본 로드되는 일이 있어, 아래는 한 번 더 강제 새로고침
+    # 초기 스크립트/위젯 부팅 여유
+    time.sleep(2)
     driver.refresh()
     WebDriverWait(driver, WAIT_SEC).until(
         EC.presence_of_all_elements_located((By.CSS_SELECTOR, "body"))
     )
     time.sleep(1)
 
-    # 날짜를 직접 바꾸는 API가 노출되지 않는 경우가 있어,
-    # 최종적으로는 현재 페이지의 HTML에서 gameId를 수집 → 날짜 필터는 review 페이지에서 확정
-    # (따라서 여기서는 별도 조작 없이 현재 날짜의 스케줄만 수집하고,
-    #  일자 루프는 driver 재기동으로 반복 호출하는 구조를 피하고,
-    #  아래 collect_gameids_from_schedule()를 날짜별로 호출할 때마다 페이지를 다시 열도록 구성)
-    # => 본 함수는 첫 로드/안정화를 위해 존재. (추가 커스터마이징 여지 남김)
-
 def collect_gameids_from_schedule_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     gids = []
-    # a 태그 href/onclick 에 gameId=YYYYMMDD 패턴이 많이 들어간다.
     for a in soup.find_all("a"):
         payload = (a.get("href", "") or "") + " " + (a.get("onclick", "") or "")
         m = GAMEID_RE.search(payload)
         if not m:
             continue
-        # 상태 텍스트(예정/취소 등)를 행 단위로 확인
+        # 행 텍스트에서 '예정/취소/우천/노게임' 등 상태 감지 시 스킵
         row = a.find_parent("tr")
         row_text = norm_text(row.get_text(" ")) if row else ""
         if any(key in row_text for key in SKIP_KEYWORDS):
             continue
         gids.append(m.group(1))
-    # 중복 제거
     return sorted(set(gids))
 
 def collect_gameids_for_date(d: date) -> List[str]:
@@ -123,7 +110,7 @@ def collect_gameids_for_date(d: date) -> List[str]:
         html = driver.page_source
         gids = collect_gameids_from_schedule_html(html)
 
-        # ✅ 날짜 필터 추가
+        # ✅ 날짜 필터: 현재 루프 날짜(YYYYMMDD)로 시작하는 gameId만 사용
         target = d.strftime("%Y%m%d")
         gids = [g for g in gids if g.startswith(target)]
 
@@ -150,24 +137,22 @@ def fetch_review(gid: str) -> Optional[Dict]:
         game_date_iso = to_iso(gid)
 
         # 구장명
-        stadium = norm_text((soup.select_one("#txtStadium") or soup.select_one("#lblStadium") or soup.select_one(".stadium")).get_text(strip=True) if (soup.select_one("#txtStadium") or soup.select_one("#lblStadium") or soup.select_one(".stadium")) else "")
+        stadium_el = (soup.select_one("#txtStadium")
+                      or soup.select_one("#lblStadium")
+                      or soup.select_one(".stadium"))
+        stadium = norm_text(stadium_el.get_text(strip=True)) if stadium_el else ""
 
         # 스코어보드 (점수)
-        # 보통 #tblScoreboard3에 실제 점수/이닝 표가 있음
         home_team = away_team = ""
         home_runs = away_runs = None
-
         sb3 = soup.select_one("#tblScoreboard3")
         if sb3:
-            # 표 구조가 자주 바뀌므로, '팀명' 행(첫열 팀명), 'R' 합계 열을 찾는 식으로 유연 파싱
-            # 1) 헤더에서 'R' 합계 열 인덱스
             r_col_idx = None
             ths = sb3.select("thead th")
             for i, th in enumerate(ths):
                 if norm_text(th.get_text()) in ("R", "득점", "점수"):
                     r_col_idx = i
                     break
-            # 2) 바디에서 두 행(원정, 홈) 파싱
             trs = sb3.select("tbody tr")
             rows = []
             for tr in trs:
@@ -176,8 +161,6 @@ def fetch_review(gid: str) -> Optional[Dict]:
                 if cells:
                     rows.append(cells)
             if r_col_idx is not None and len(rows) >= 2:
-                # 관례상 원정이 먼저, 홈이 다음인 경우가 많다 (예외 대응 위해 아래 보정 로직 포함).
-                # 팀명은 첫 셀(또는 첫 TH)
                 away_team = rows[0][0]
                 home_team = rows[1][0]
                 away_runs = safe_int(rows[0][r_col_idx], 0) if len(rows[0]) > r_col_idx else 0
@@ -188,7 +171,6 @@ def fetch_review(gid: str) -> Optional[Dict]:
             sb1 = soup.select_one("#tblScoreboard1")
             if sb1:
                 tds = sb1.find_all("td")
-                # 보통 [홈팀, 승패, 원정팀] 식 배열이 많아 방어적으로 처리
                 texts = [norm_text(td.get_text()) for td in tds]
                 if len(texts) >= 3:
                     home_team = home_team or texts[0]
@@ -203,7 +185,6 @@ def fetch_review(gid: str) -> Optional[Dict]:
             if not tbl:
                 return 0, 0
             hits_idx = hr_idx = None
-            # 헤더에서 'H'(안타), 'HR'(홈런) 유사 컬럼 찾기
             heads = tbl.select("thead th")
             for i, th in enumerate(heads):
                 t = norm_text(th.get_text()).upper()
@@ -224,7 +205,6 @@ def fetch_review(gid: str) -> Optional[Dict]:
                     total_hr += safe_int(cells[hr_idx], 0)
             return total_h, total_hr
 
-        # 홈/원정 타자 기록 표 id는 페이지마다 다소 차이 → 여러 후보 시도
         for sel_home in ["#tblHomeHitter2", "#tblHomeHitter", "#tblHitterHome"]:
             h, hr = sum_hits_hr(sel_home)
             if h or hr:
@@ -236,7 +216,6 @@ def fetch_review(gid: str) -> Optional[Dict]:
                 away_hits, away_hr = h, hr
                 break
 
-        # 기본 타당성 체크(경고 로그만 출력; 데이터는 유지)
         if (home_hr and home_hits and home_hr > home_hits) or (away_hr and away_hits and away_hr > away_hits):
             print(f"[WARN] HR > H ? gid={gid} home({home_hr}/{home_hits}) away({away_hr}/{away_hits})", file=sys.stderr)
 
@@ -277,6 +256,7 @@ def load_existing_ids(out_csv: str) -> set:
 def append_rows(out_csv: str, rows: List[Dict]) -> None:
     if not rows:
         return
+    ensure_parent_dir(out_csv)
     df = pd.DataFrame(rows)
     write_header = not os.path.exists(out_csv)
     df.to_csv(out_csv, mode="a", header=write_header, index=False, encoding="utf-8")
@@ -289,7 +269,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default=DEFAULT_SINCE, help="수집 시작일(YYYYMMDD)")
     ap.add_argument("--until", default=None, help="수집 종료일(YYYYMMDD, 미지정 시 오늘)")
-    ap.add_argument("--out",   default="kbo_latest.csv", help="출력 CSV 파일명")
+    ap.add_argument("--out",   default="data/kbo_latest.csv", help="출력 CSV 파일명")
     args = ap.parse_args()
 
     since = datetime.strptime(args.since, "%Y%m%d").date()
@@ -300,7 +280,6 @@ def main():
 
     all_new_rows: List[Dict] = []
 
-    # 날짜 루프
     d = since
     while d <= until:
         print(f"[DAY] {d.isoformat()} 수집 시도…")
@@ -310,17 +289,13 @@ def main():
         else:
             print(f"[DAY] {d.isoformat()} 발견 gameId={gids}")
 
-        # 각 gid 리뷰 페이지 파싱
         day_rows: List[Dict] = []
         for gid in gids:
-            # 증분: 이미 있는 gameId는 스킵
             if gid in existing:
                 continue
-            # gameId의 앞 8자(YYYYMMDD)로 날짜 확정 → 다른 날짜의 gid가 섞여도 안전
             row = fetch_review(gid)
             if not row:
                 continue
-            # 월요일 필터는 적용하지 않음(포스트시즌/편성 예외 존재). gameId 날짜가 진실.
             day_rows.append(row)
 
         if day_rows:
@@ -328,7 +303,6 @@ def main():
             existing.update(r["gameId"] for r in day_rows)
             all_new_rows.extend(day_rows)
 
-        # polite
         time.sleep(1.0)
         d += timedelta(days=1)
 
@@ -336,4 +310,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
