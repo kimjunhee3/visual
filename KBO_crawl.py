@@ -120,11 +120,13 @@ def collect_gameids_for_date(d: date) -> List[str]:
     driver = make_driver()
     try:
         goto_schedule_date(driver, d)
-        # 실제로는 스케줄 페이지가 기본 ‘오늘’만 로드될 수 있으므로,
-        # 날짜 루프에서 매일 페이지를 열어도, 노출된 gameId가 해당 일자와 다를 수 있다.
-        # 어쨌든 수집한 뒤 review에서 날짜를 확정하고 (gameId의 YYYYMMDD) by design.
         html = driver.page_source
         gids = collect_gameids_from_schedule_html(html)
+
+        # ✅ 날짜 필터 추가
+        target = d.strftime("%Y%m%d")
+        gids = [g for g in gids if g.startswith(target)]
+
         return gids
     finally:
         driver.quit()
