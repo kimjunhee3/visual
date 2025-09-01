@@ -1,0 +1,6 @@
+﻿date,stadium,away_team,home_team,away_score,home_score,away_result,home_result,away_hit,home_hit,away_hr,home_hr,away_ab,home_ab
+2025-07-01,잠실,삼성,두산,4,1,승,패,7,3,1,0,30,30
+2025-07-01,사직,LG,롯데,3,2,승,패,8,5,1,0,32,29
+2025-07-01,수원,키움,KT,7,3,승,패,13,5,1,2,38,31
+2025-07-01,광주,SSG,KIA,2,3,패,승,5,6,1,0,31,28
+2025-07-01,대전,NC,한화,4,8,패,승,10,9,0,3,34,29
