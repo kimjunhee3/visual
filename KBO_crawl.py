@@ -12,6 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime, timedelta
+import argparse
 
 DEFAULT_SINCE = "20250322"
 
@@ -496,18 +497,27 @@ def get_dates_to_crawl_from_last_update(last_update_path=None, since=None, force
         d += timedelta(days=1)
     return dates
 
-
-# ========= 메인 =========
+def get_backfill_dates(days_back: int) -> list[str]:
+    """오늘 포함 최근 N일(=days_back) 날짜 리스트(YYYYMMDD)."""
+    today = datetime.today().date()
+    start = today - timedelta(days=max(0, days_back-1))
+    d, out = start, []
+    while d <= today:
+        out.append(d.strftime("%Y%m%d"))
+        d += timedelta(days=1)
+    return out
 
 def main():
     print("초정밀 KBO 크롤링 시작")
-    # ⬇️ 증분 시작: last_update.json(있으면) 또는 data/kbo_latest.csv의 마지막 날짜+1
-    dates_to_crawl = get_dates_to_crawl_from_last_update("static/cache/last_update.json", force_default=False)
-    if not dates_to_crawl:
-        print("새로 크롤링할 경기가 없습니다.")
-        return
-    print("신규 경기 날짜:", dates_to_crawl)
-    
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days-back", type=int, default=7, help="오늘 포함 최근 N일을 backfill")
+    args = ap.parse_args()
+
+    # ✅ 항상 최근 N일을 재수집 (예정→종료 갱신 보장)
+    dates_to_crawl = get_backfill_dates(args.days_back)
+    print("백필 대상 날짜:", dates_to_crawl)
+
     crawler = UltraPreciseKBOCrawler()
     try:
         results = crawler.crawl_kbo_games(dates_to_crawl, force_refresh=True)
