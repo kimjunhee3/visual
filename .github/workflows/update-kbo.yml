@@ -1,35 +1,50 @@
 name: Update KBO CSV daily
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "수집 시작일(YYYYMMDD)"
+        required: false
+        default: "20250322"
+      until:
+        description: "수집 종료일(YYYYMMDD, 미지정 시 오늘)"
+        required: false
+        default: ""
+      out:
+        description: "출력 CSV 파일명"
+        required: false
+        default: "kbo_latest.csv"
   schedule:
-    # 한국시간(KST, UTC+9) 기준 09:10 / 12:10 / 18:10 / 23:40
-    - cron: "10 00 * * *"   # 09:10 KST
-    - cron: "10 03 * * *"   # 12:10 KST
-    - cron: "10 09 * * *"   # 18:10 KST
+    # KST(+9) 기준으로 넉넉히 2회 실행 예시 (UTC로 적음)
     - cron: "40 14 * * *"   # 23:40 KST
+    - cron: "10 16 * * *"   # 01:10 KST
 
 permissions:
-  contents: write
+  contents: write   # CSV 커밋/푸시 위해 필요
 
-# 동시간대 중복 실행 방지
+# 동시 실행 제한 (대기 누적 방지)
 concurrency:
   group: kbo-csv-update
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Seoul   # 로그/시간대 고정
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
@@ -40,65 +55,61 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 필요한 패키지 보강
           pip install selenium beautifulsoup4 pandas numpy requests
 
-      # ✅ 최근 N일(기본 7일) 백필로 항상 '예정'을 덮어쓰도록 실행
-      - name: Run crawler (headless; backfill recent 7 days)
-        env:
-          PYTHONUNBUFFERED: "1"
+      - name: Show inputs / decide dates
+        id: ds
+        shell: bash
         run: |
-          python KBO_crawl.py --days-back 7
-          ls -lh kbo_games_ultra_precise_*.csv || true
+          SINCE="${{ github.event.inputs.since }}"
+          UNTIL="${{ github.event.inputs.until }}"
+          OUT="${{ github.event.inputs.out }}"
+          if [ -z "$OUT" ]; then OUT="kbo_latest.csv"; fi
+          echo "since=$SINCE"   >> $GITHUB_OUTPUT
+          echo "until=$UNTIL"   >> $GITHUB_OUTPUT
+          echo "out=$OUT"       >> $GITHUB_OUTPUT
+          echo "Resolved -> since=$SINCE until=$UNTIL out=$OUT"
 
-      # ✅ 머지 시 '예정'보다 결과가 있는 레코드가 우선되도록 품질 정렬
-      - name: Merge into data/kbo_latest.csv (dedupe with quality)
+      - name: Run crawler (headless)
+        # KBO_crawl.py가 리포지토리 루트에 있다고 가정
         run: |
-          python - << 'PY'
-          import pandas as pd, glob, os, numpy as np
-          latest_path = "data/kbo_latest.csv"
-          os.makedirs("data", exist_ok=True)
+          set -e
+          SINCE="${{ steps.ds.outputs.since }}"
+          UNTIL="${{ steps.ds.outputs.until }}"
+          OUT="${{ steps.ds.outputs.out }}"
+          if [ -z "$UNTIL" ]; then
+            python KBO_crawl.py --since "$SINCE" --out "$OUT"
+          else
+            python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT"
+          fi
+          ls -lh "$OUT" || true
 
-          base = pd.read_csv(latest_path, encoding="utf-8-sig") if os.path.exists(latest_path) else pd.DataFrame()
-          files = sorted(glob.glob("kbo_games_ultra_precise_*.csv"))
-          if not files:
-              print("No new crawl file; keep current.")
-              raise SystemExit(0)
-
-          new = pd.read_csv(files[-1], encoding="utf-8-sig")
-          combined = pd.concat([base, new], ignore_index=True)
-
-          # 품질 점수: 예정(-1) < 진행중(0) < 승/패/무(1) < 종료(2)
-          def q(v):
-              v = str(v)
-              if v == "예정": return -1
-              if v == "진행중": return 0
-              if v in ("승","패","무"): return 1
-              return 2
-          combined["__q__"] = np.maximum(combined.get("away_result","").map(q),
-                                         combined.get("home_result","").map(q))
-
-          combined["__date__"] = pd.to_datetime(combined["date"], errors="coerce")
-
-          # 같은 경기 키 안에서 품질 점수 높은(뒤쪽) 것이 남도록 정렬 후 drop_duplicates
-          combined = combined.sort_values(
-              ["date","away_team","home_team","__q__","__date__"],
-              ascending=[True, True, True, True, True]
-          ).drop_duplicates(subset=["date","away_team","home_team"], keep="last")
-
-          # 정리 및 저장
-          combined = combined.sort_values(["__date__","stadium","away_team","home_team"])
-          combined["date"] = combined["__date__"].dt.strftime("%Y-%m-%d")
-          combined = combined.drop(columns=["__q__","__date__"], errors="ignore")
-
-          combined.to_csv(latest_path, index=False, encoding="utf-8-sig")
-          print("Wrote:", latest_path, "rows:", len(combined))
-          PY
-
-      - name: Commit & Push
+      - name: Git commit CSV if changed
+        id: commit
         run: |
           git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/kbo_latest.csv
-          git commit -m "chore(data): auto-update kbo_latest.csv [skip ci]" || echo "No changes"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changes=false" >> $GITHUB_OUTPUT
+            echo "No changes to commit."
+          else
+            git commit -m "chore(data): auto-update kbo_latest.csv [skip ci]"
+            echo "changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push
+        if: steps.commit.outputs.changes == 'true'
+        run: |
           git push
+
+      # (선택) 아티팩트로 CSV 보관
+      - name: Upload artifact (CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kbo-csv
+          path: ${{ steps.ds.outputs.out }}
+          if-no-files-found: ignore
