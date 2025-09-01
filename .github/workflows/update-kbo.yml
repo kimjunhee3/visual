@@ -3,12 +3,19 @@ name: Update KBO CSV daily
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "40 16 * * *"   # 매일 01:40 KST
-    - cron: "30 18 * * *"   # 매일 03:30 KST
-    - cron: "10 21 * * *"   # 매일 06:10 KST
-    
+    # 한국시간(KST, UTC+9) 기준 09:10 / 12:10 / 18:10 / 23:40
+    - cron: "10 00 * * *"   # 09:10 KST
+    - cron: "10 03 * * *"   # 12:10 KST
+    - cron: "10 09 * * *"   # 18:10 KST
+    - cron: "40 14 * * *"   # 23:40 KST
+
 permissions:
   contents: write
+
+# 동시간대 중복 실행 방지
+concurrency:
+  group: kbo-csv-update
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -22,6 +29,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
@@ -35,30 +43,54 @@ jobs:
           pip install -r requirements.txt
           pip install selenium beautifulsoup4 pandas numpy requests
 
-      - name: Run crawler (headless)
+      # ✅ 최근 N일(기본 7일) 백필로 항상 '예정'을 덮어쓰도록 실행
+      - name: Run crawler (headless; backfill recent 7 days)
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          python KBO_crawl.py
+          python KBO_crawl.py --days-back 7
           ls -lh kbo_games_ultra_precise_*.csv || true
 
-      - name: Merge into data/kbo_latest.csv (dedupe)
+      # ✅ 머지 시 '예정'보다 결과가 있는 레코드가 우선되도록 품질 정렬
+      - name: Merge into data/kbo_latest.csv (dedupe with quality)
         run: |
           python - << 'PY'
-          import pandas as pd, glob, os
+          import pandas as pd, glob, os, numpy as np
           latest_path = "data/kbo_latest.csv"
           os.makedirs("data", exist_ok=True)
+
           base = pd.read_csv(latest_path, encoding="utf-8-sig") if os.path.exists(latest_path) else pd.DataFrame()
           files = sorted(glob.glob("kbo_games_ultra_precise_*.csv"))
           if not files:
               print("No new crawl file; keep current.")
               raise SystemExit(0)
+
           new = pd.read_csv(files[-1], encoding="utf-8-sig")
           combined = pd.concat([base, new], ignore_index=True)
-          combined = combined.drop_duplicates(subset=["date","away_team","home_team"], keep="last")
-          combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
-          combined = combined.sort_values(["date","stadium","away_team","home_team"])
-          combined["date"] = combined["date"].dt.strftime("%Y-%m-%d")
+
+          # 품질 점수: 예정(-1) < 진행중(0) < 승/패/무(1) < 종료(2)
+          def q(v):
+              v = str(v)
+              if v == "예정": return -1
+              if v == "진행중": return 0
+              if v in ("승","패","무"): return 1
+              return 2
+          combined["__q__"] = np.maximum(combined.get("away_result","").map(q),
+                                         combined.get("home_result","").map(q))
+
+          combined["__date__"] = pd.to_datetime(combined["date"], errors="coerce")
+
+          # 같은 경기 키 안에서 품질 점수 높은(뒤쪽) 것이 남도록 정렬 후 drop_duplicates
+          combined = combined.sort_values(
+              ["date","away_team","home_team","__q__","__date__"],
+              ascending=[True, True, True, True, True]
+          ).drop_duplicates(subset=["date","away_team","home_team"], keep="last")
+
+          # 정리 및 저장
+          combined = combined.sort_values(["__date__","stadium","away_team","home_team"])
+          combined["date"] = combined["__date__"].dt.strftime("%Y-%m-%d")
+          combined = combined.drop(columns=["__q__","__date__"], errors="ignore")
+
           combined.to_csv(latest_path, index=False, encoding="utf-8-sig")
           print("Wrote:", latest_path, "rows:", len(combined))
           PY
