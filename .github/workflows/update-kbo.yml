@@ -19,7 +19,8 @@ on:
     # KST(+9) 기준으로 넉넉히 2회 실행 예시 (UTC로 적음)
     - cron: "40 14 * * *"   # 23:40 KST
     - cron: "10 16 * * *"   # 01:10 KST
-
+    - cron: "20 18 * * *"   # 03:20 KST
+    
 permissions:
   contents: write   # CSV 커밋/푸시 위해 필요
 
