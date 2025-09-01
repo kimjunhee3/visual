@@ -18,9 +18,9 @@ on:
     - cron: "20 18 * * *"   # 03:20 KST
 
 permissions:
-  contents: write   # CSV 커밋/푸시 위해 필요
+  contents: write
 
-# 동시 실행 제한 (대기 누적 방지)
+# 대기(Waiting) 방지: 겹치면 이전 실행 취소 후 즉시 새 실행
 concurrency:
   group: kbo-csv-update
   cancel-in-progress: true
@@ -29,7 +29,7 @@ jobs:
   update:
     runs-on: ubuntu-latest
     env:
-      TZ: Asia/Seoul   # 로그/시간대 고정
+      TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -62,9 +62,16 @@ jobs:
           SINCE="${{ github.event.inputs.since }}"
           UNTIL="${{ github.event.inputs.until }}"
           if [ -z "$SINCE" ]; then SINCE="20250322"; fi
-          echo "since=$SINCE"   >> $GITHUB_OUTPUT
-          echo "until=$UNTIL"   >> $GITHUB_OUTPUT
+          echo "since=$SINCE" >> $GITHUB_OUTPUT
+          echo "until=$UNTIL" >> $GITHUB_OUTPUT
           echo "Resolved -> since=$SINCE until=$UNTIL"
+
+      # 디버그: CSV 존재/헤더 확인 (필요 없으면 나중에 제거해도 됩니다)
+      - name: Pre-check CSV in repo
+        run: |
+          ls -lah
+          ls -lah data || true
+          sed -n '1,5p' data/kbo_latest.csv || true
 
       - name: Run crawler (headless)
         run: |
@@ -78,6 +85,7 @@ jobs:
             python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT"
           fi
           ls -lh "$OUT" || true
+          sed -n '1,5p' "$OUT" || true
 
       - name: Commit CSV if changed
         id: commit
@@ -95,8 +103,7 @@ jobs:
 
       - name: Push
         if: steps.commit.outputs.changes == 'true'
-        run: |
-          git push
+        run: git push
 
       - name: Upload artifact (CSV)
         if: always()
