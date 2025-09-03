@@ -11,8 +11,12 @@ on:
         description: "수집 종료일(YYYYMMDD, 미지정 시 어제)"
         required: false
         default: ""
+      force_refresh:
+        description: "체크포인트 무시하고 새로 파싱"
+        required: false
+        default: "false"
   schedule:
-    # KST(+9) 기준 분산 3회 (UTC 기입)
+    # KST(+9) 기준 분산 3회 (UTC로 기입)
     - cron: "40 14 * * *"   # 23:40 KST
     - cron: "10 16 * * *"   # 01:10 KST
     - cron: "20 18 * * *"   # 03:20 KST
@@ -30,7 +34,7 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
-      DEFAULT_LOOKBACK_DAYS: "5"      # 최근 5일만
+      DEFAULT_LOOKBACK_DAYS: "5"      # 최근 5일
       DEFAULT_UNTIL_OFFSET_DAYS: "1"  # 종료일 = 어제
 
     steps:
@@ -43,6 +47,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
@@ -70,21 +75,32 @@ jobs:
           echo "until=$UNTIL" >> $GITHUB_OUTPUT
           echo "Resolved -> since=$SINCE until=$UNTIL"
 
-      - name: Pre-check CSV
+      - name: Prepare dirs (static/cache & data)
         run: |
-          ls -lah
+          mkdir -p static/cache
+          mkdir -p data
+
+      - name: Pre-check CSV (optional)
+        run: |
           ls -lah data || true
-          sed -n '1,10p' data/kbo_latest.csv || true
+          sed -n '1,8p' data/kbo_latest.csv || true
 
       - name: Run crawler (headless)
-        run: |
-          set -e
-          SINCE="${{ steps.ds.outputs.since }}"
-          UNTIL="${{ steps.ds.outputs.until }}"
-          OUT="data/kbo_latest.csv"
-          python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT"
-          ls -lh "$OUT" || true
-          sed -n '1,10p' "$OUT" || true
+        # 실패 일시적일 수 있어 최대 2번 재시도
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 20
+          max_attempts: 2
+          command: |
+            set -e
+            SINCE="${{ steps.ds.outputs.since }}"
+            UNTIL="${{ steps.ds.outputs.until }}"
+            OUT="data/kbo_latest.csv"
+            FORCE="${{ github.event.inputs.force_refresh }}"
+            if [ "${FORCE}" = "true" ]; then EXTRA="--force_refresh"; else EXTRA=""; fi
+            python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT" $EXTRA
+            echo "---- CSV HEAD ----"
+            sed -n '1,12p' "$OUT" || true
 
       - name: Commit CSV if changed
         id: commit
@@ -111,3 +127,4 @@ jobs:
           name: kbo-csv
           path: data/kbo_latest.csv
           if-no-files-found: ignore
+
