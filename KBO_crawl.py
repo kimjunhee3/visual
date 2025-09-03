@@ -12,7 +12,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime, timedelta
-
+# KBO_crawl.py 상단에 추가 임포트
+import tempfile, shutil
+from selenium.common.exceptions import SessionNotCreatedException
 
 DEFAULT_SINCE = "20250322"
 
@@ -32,22 +34,53 @@ def _to_int(txt: str) -> int:
 class UltraPreciseKBOCrawler:
     def __init__(self):
         self.driver = None
+        self._tmp_profile = None
         self.setup_driver()
 
     def setup_driver(self):
-        options = Options()
-        # options.add_argument("--headless")   # headless 켜면 서버에서 실행 가능
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        """고유 user-data-dir을 사용하고, 프로필 충돌 시 1회 재시도"""
+        def make_opts(profile_dir: str) -> Options:
+            opts = Options()
+            # CI/컨테이너 친화 옵션
+            opts.add_argument("--headless=new")             # GH Actions에서 권장
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--window-size=1920,1080")
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--no-default-browser-check")
+            # 임시 프로필 (중복/잠김 회피)
+            opts.add_argument(f"--user-data-dir={profile_dir}")
+            opts.add_argument("--profile-directory=Default")
+            # 디버깅 포트 임의 할당(충돌 방지)
+            opts.add_argument("--remote-debugging-port=0")
+            # 필요시 UA
+            # opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...")
+            # 군더더기 경고 제거(선택)
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+            return opts
+
+        # 1차 시도: 새 임시 프로필
+        self._tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
         try:
-            self.driver = webdriver.Chrome(options=options)
-            self.driver.set_page_load_timeout(30)
-            print("ChromeDriver 시작 성공")
-        except Exception as e:
-            print(f"ChromeDriver 시작 실패: {e}")
-            raise
+            self.driver = webdriver.Chrome(options=make_opts(self._tmp_profile))
+            self.driver.set_page_load_timeout(60)
+            print(f"Chrome started with profile: {self._tmp_profile}")
+            return
+        except SessionNotCreatedException as e:
+            print("Chrome session not created (profile lock). Retrying with a fresh profile…")
+            try:
+                shutil.rmtree(self._tmp_profile, ignore_errors=True)
+            except Exception:
+                pass
+
+        # 2차 시도: 또 다른 새 임시 프로필
+        self._tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
+        self.driver = webdriver.Chrome(options=make_opts(self._tmp_profile))
+        self.driver.set_page_load_timeout(60)
+        print(f"Chrome started with profile (retry): {self._tmp_profile}")
 
     def crawl_kbo_games(self, date_list, checkpoint_dir="checkpoints", force_refresh=False):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -88,7 +121,12 @@ class UltraPreciseKBOCrawler:
         if self.driver:
             try:
                 self.driver.quit()
-            except:
+            except Exception:
+                pass
+        if getattr(self, "_tmp_profile", None):
+            try:
+                shutil.rmtree(self._tmp_profile, ignore_errors=True)
+            except Exception:
                 pass
 
     def extract_ultra_precise_game_info(self, game, date):
