@@ -53,17 +53,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Chrome만 설치 (Chromedriver 설치 스텝 제거)
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
-
-      - name: Install ChromeDriver
-        uses: nanasess/setup-chromedriver@v2
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install selenium beautifulsoup4 pandas numpy requests
+          # Selenium Manager를 사용할 수 있게 최신 버전 고정
+          pip install "selenium>=4.21.0" beautifulsoup4 pandas numpy requests
 
       - name: Resolve date range
         id: ds
@@ -102,7 +100,7 @@ jobs:
           done
           ls -lah checkpoints || true
 
-      - name: Run crawler (headless) and upsert CSV
+      - name: Run crawler (headless) and upsert CSV (with retry)
         shell: bash
         run: |
           set -e
@@ -119,7 +117,10 @@ jobs:
 
           echo "[INFO] Running crawler for ${SINCE}..${UNTIL} (force_refresh=${FORCE})"
 
-          python - << 'PY'
+          # --- 소프트 리트라이 2회: 크롬 일시적 크래시 방지 ---
+          attempt=1
+          max_attempts=2
+          until python - << 'PY'
           import os, sys
           import pandas as pd
           from datetime import datetime, timedelta
@@ -144,6 +145,7 @@ jobs:
 
           dates = days(SINCE, UNTIL)
 
+          # 크롤러 임포트
           sys.path.insert(0, ".")
           from KBO_crawl import UltraPreciseKBOCrawler
 
@@ -155,7 +157,6 @@ jobs:
                   print("[INFO] No rows collected in range; skipping upsert.")
                   raise SystemExit(0)
 
-              # 스키마/숫자 보정
               keep = ["date","stadium","away_team","home_team","away_score","home_score",
                       "away_result","home_result","away_hit","home_hit","away_hr","home_hr",
                       "away_ab","home_ab","away_avg","home_avg"]
@@ -194,6 +195,15 @@ jobs:
           finally:
               crawler.cleanup()
           PY
+          do
+            attempt=$((attempt+1))
+            if [ $attempt -gt $max_attempts ]; then
+              echo "[FATAL] Crawler failed after ${max_attempts} attempts."
+              exit 1
+            fi
+            echo "[WARN] Crawler failed. Retrying (attempt ${attempt}/${max_attempts}) in 10s…"
+            sleep 10
+          done
 
           echo "---- CSV HEAD ----"
           sed -n '1,12p' "$OUT" || true
