@@ -6,9 +6,9 @@ on:
       since:
         description: "수집 시작일(YYYYMMDD)"
         required: false
-        default: "20250322"
+        default: ""
       until:
-        description: "수집 종료일(YYYYMMDD, 미지정 시 오늘)"
+        description: "수집 종료일(YYYYMMDD, 미지정 시 어제)"
         required: false
         default: ""
   schedule:
@@ -20,7 +20,6 @@ on:
 permissions:
   contents: write
 
-# 대기(Waiting) 방지: 겹치면 이전 실행 취소 후 즉시 새 실행
 concurrency:
   group: kbo-csv-update
   cancel-in-progress: true
@@ -31,6 +30,8 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
+      DEFAULT_LOOKBACK_DAYS: "5"     # ← 최근 5일로 축소
+      DEFAULT_UNTIL_OFFSET_DAYS: "1" # 종료일: 어제
 
     steps:
       - name: Checkout
@@ -55,19 +56,21 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install selenium beautifulsoup4 pandas numpy requests
 
-      - name: Resolve inputs
+      - name: Resolve date range
         id: ds
         shell: bash
         run: |
-          SINCE="${{ github.event.inputs.since }}"
-          UNTIL="${{ github.event.inputs.until }}"
-          if [ -z "$SINCE" ]; then SINCE="20250322"; fi
+          IN_SINCE="${{ github.event.inputs.since }}"
+          IN_UNTIL="${{ github.event.inputs.until }}"
+          YEST=$(date -d "-${DEFAULT_UNTIL_OFFSET_DAYS} day" +%Y%m%d)
+          SINCE_CALC=$(date -d "-${DEFAULT_LOOKBACK_DAYS} day" +%Y%m%d)
+          if [ -z "$IN_SINCE" ]; then SINCE="$SINCE_CALC"; else SINCE="$IN_SINCE"; fi
+          if [ -z "$IN_UNTIL" ]; then UNTIL="$YEST"; else UNTIL="$IN_UNTIL"; fi
           echo "since=$SINCE" >> $GITHUB_OUTPUT
           echo "until=$UNTIL" >> $GITHUB_OUTPUT
           echo "Resolved -> since=$SINCE until=$UNTIL"
 
-      # 디버그: CSV 존재/헤더 확인 (필요 없으면 나중에 제거해도 됩니다)
-      - name: Pre-check CSV in repo
+      - name: Pre-check CSV
         run: |
           ls -lah
           ls -lah data || true
@@ -79,11 +82,7 @@ jobs:
           SINCE="${{ steps.ds.outputs.since }}"
           UNTIL="${{ steps.ds.outputs.until }}"
           OUT="data/kbo_latest.csv"
-          if [ -z "$UNTIL" ]; then
-            python KBO_crawl.py --since "$SINCE" --out "$OUT"
-          else
-            python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT"
-          fi
+          python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT"
           ls -lh "$OUT" || true
           sed -n '1,5p' "$OUT" || true
 
@@ -112,3 +111,4 @@ jobs:
           name: kbo-csv
           path: data/kbo_latest.csv
           if-no-files-found: ignore
+
