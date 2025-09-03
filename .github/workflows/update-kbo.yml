@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
   schedule:
-    # KST(+9) 기준 분산 3회 (UTC로 기입)
+    # KST(+9) 기준 분산 3회 (UTC 기입)
     - cron: "40 14 * * *"   # 23:40 KST
     - cron: "10 16 * * *"   # 01:10 KST
     - cron: "20 18 * * *"   # 03:20 KST
@@ -30,8 +30,8 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
-      DEFAULT_LOOKBACK_DAYS: "5"     # ← 최근 5일로 축소
-      DEFAULT_UNTIL_OFFSET_DAYS: "1" # 종료일: 어제
+      DEFAULT_LOOKBACK_DAYS: "5"      # 최근 5일만
+      DEFAULT_UNTIL_OFFSET_DAYS: "1"  # 종료일 = 어제
 
     steps:
       - name: Checkout
@@ -74,7 +74,7 @@ jobs:
         run: |
           ls -lah
           ls -lah data || true
-          sed -n '1,5p' data/kbo_latest.csv || true
+          sed -n '1,10p' data/kbo_latest.csv || true
 
       - name: Run crawler (headless)
         run: |
@@ -84,7 +84,7 @@ jobs:
           OUT="data/kbo_latest.csv"
           python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT"
           ls -lh "$OUT" || true
-          sed -n '1,5p' "$OUT" || true
+          sed -n '1,10p' "$OUT" || true
 
       - name: Commit CSV if changed
         id: commit
@@ -111,4 +111,3 @@ jobs:
           name: kbo-csv
           path: data/kbo_latest.csv
           if-no-files-found: ignore
-
