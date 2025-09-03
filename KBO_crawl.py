@@ -133,7 +133,7 @@ class UltraPreciseKBOCrawler:
             shutil.rmtree(self._tmp_profile, ignore_errors=True)
 
     # --------------- list page helpers ---------------
-        def _extract_one_game_from_list(self, li, url_date_yyyymmdd: str) -> dict | None:
+    def _extract_one_game_from_list(self, li, url_date_yyyymmdd: str) -> dict | None:
         """리스트에 있는 한 경기 블록에서 기본 정보 추출"""
         try:
             game_id = li.get("g_id") or li.get("gid") or ""
