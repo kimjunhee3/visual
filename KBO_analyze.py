@@ -1,11 +1,8 @@
-# KBO_analyze.py
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
-import os
-import shutil
-import re
+import os, re, shutil
 import requests
 from datetime import datetime, timedelta
 
@@ -21,7 +18,7 @@ CACHE_DIR = os.path.join(BASE_DIR, "static", "cache")
 os.makedirs(os.path.dirname(LOCAL_CSV), exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-REMOTE_CSV_URL = os.getenv("KBO_CSV_URL", "").strip()  # 깃허브 raw CSV 주소
+REMOTE_CSV_URL = os.getenv("KBO_CSV_URL", "").strip()  # 깃허브 raw CSV 주소(선택)
 CSV_MAX_AGE_MIN = int(os.getenv("CSV_MAX_AGE_MIN", "5"))  # 방문 간 최소 확인 주기(분)
 FILTER_SCHEDULED = os.getenv("FILTER_SCHEDULED", "0").lower() in ("1", "true", "yes")
 
@@ -40,7 +37,6 @@ def _write_text(path, txt):
         f.write(txt)
 
 def _need_refresh():
-    """마지막 확인 후 CSV_MAX_AGE_MIN분 지났는지."""
     try:
         last = _read_text(MTIME_PATH)
         if not last:
@@ -51,11 +47,7 @@ def _need_refresh():
         return True
 
 def ensure_latest_csv(force=False):
-    """
-    방문 시 호출: 원격 CSV가 바뀌었으면 로컬(data/kbo_latest.csv)로 저장하고
-    메모리 캐시 무효화.
-    """
-    global kbo_data_cache
+    """REMOTE_CSV_URL 지정 시: 변경되었으면 LOCAL_CSV로 갱신."""
     if not REMOTE_CSV_URL:
         return False
     if not force and not _need_refresh():
@@ -84,7 +76,6 @@ def ensure_latest_csv(force=False):
         clear_kbo_data_cache()
         return True
     except Exception:
-        # 원격 실패 시 조용히 무시(기존 파일로 계속 서비스)
         return False
 
 @app.before_request
@@ -111,7 +102,6 @@ def keep_latest_kbo_csv(backup_dir="csv_backup"):
             pass
     print(f"최신 파일만 남기고 {len(csv_files)-1}개 백업 완료: {latest}")
 
-# 서버 시작 시 1회(로컬 개발 편의)
 try:
     keep_latest_kbo_csv()
 except Exception:
@@ -188,11 +178,9 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
 
-    # (선택) 예정 경기 숨기기: 환경변수 FILTER_SCHEDULED=1 이면 제거
     if FILTER_SCHEDULED and {'away_result','home_result'}.issubset(df.columns):
         df = df[~((df['away_result']=='예정') & (df['home_result']=='예정'))].copy()
 
-    # 날짜 문자열 표준화
     if 'date' in df.columns:
         try:
             df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -202,7 +190,7 @@ def _post_load_normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================
-# 데이터 로드 (항상 LOCAL_CSV 우선)
+# 데이터 로드
 # =========================
 def load_latest_kbo_data():
     global kbo_data_cache
@@ -210,13 +198,12 @@ def load_latest_kbo_data():
         if kbo_data_cache is not None:
             return kbo_data_cache
 
-        # 1순위: 고정 로컬 파일 (ensure_latest_csv가 갱신)
         if os.path.exists(LOCAL_CSV):
             kbo_data_cache = pd.read_csv(LOCAL_CSV, encoding='utf-8-sig')
             kbo_data_cache = _post_load_normalize(kbo_data_cache)
             return kbo_data_cache
 
-        # 2순위: 로컬에 남아있는 최신 kbo_games_*.csv
+        # fallback: 저장된 kbo_games_*.csv
         preferred_file = os.getenv("KBO_PREFERRED_CSV")
         candidates = []
         if preferred_file:
@@ -228,17 +215,14 @@ def load_latest_kbo_data():
         used = None
         for c in candidates:
             if os.path.exists(c):
-                used = c
-                break
+                used = c; break
         if not used:
             return None
 
         kbo_data_cache = pd.read_csv(used, encoding='utf-8-sig')
         kbo_data_cache = _post_load_normalize(kbo_data_cache)
         return kbo_data_cache
-    except Exception as e:
-        import logging
-        logging.exception("데이터 로드 오류")
+    except Exception:
         return None
 
 def clear_kbo_data_cache():
@@ -260,53 +244,46 @@ def stadium_entrance(stadium):
     stadium = _canonicalize_stadium_input(stadium)
     return redirect(url_for('stadium_chart', stadium=stadium, team=selected_team))
 
-@app.route("/stadium/<stadium>/data")
-def stadium_data_overview(stadium):
-    selected_team = re.sub(r'\s+', '', (request.args.get('team') or ''))
-    stadium = _canonicalize_stadium_input(stadium)
+@app.route("/api/teams")
+def get_teams():
+    return jsonify(["LG","두산","키움","SSG","KT","한화","삼성","KIA","NC","롯데"])
 
-    df = load_latest_kbo_data()
+def _summary_and_games(df: pd.DataFrame, team: str, stadium: str = None, recent_n: int = 10):
     if df is None:
-        return jsonify({"error": "데이터가 없습니다.", "summary": None, "games": []}), 200
+        return None, []
 
-    mask_st = (df['stadium'] == stadium)
-    team_games = df[((df['away_team'] == selected_team) | (df['home_team'] == selected_team)) & mask_st].copy()
-    is_away = (team_games['away_team'] == selected_team)
-    is_home = (team_games['home_team'] == selected_team)
+    if stadium:
+        df = df[df['stadium'] == stadium].copy()
 
-    team_result = np.where(is_home, team_games['home_result'], team_games['away_result'])
+    team_games = df[(df['away_team'] == team) | (df['home_team'] == team)].copy()
+    is_away = (team_games['away_team'] == team)
+    is_home = (team_games['home_team'] == team)
+
+    team_result = np.where(is_home, team_games['home_result'], team_games['away_result']).astype(str)
     finished_mask = (team_result != '예정')
 
     res_list = (
-        team_games.loc[is_away & finished_mask, 'away_result'].tolist()
-      + team_games.loc[is_home  & finished_mask, 'home_result'].tolist()
+       team_games.loc[is_away & finished_mask, 'away_result'].tolist()
+     + team_games.loc[is_home  & finished_mask, 'home_result'].tolist()
     )
-    wins = res_list.count('승')
-    losses = res_list.count('패')
-    draws = res_list.count('무')
+    wins = res_list.count('승'); losses = res_list.count('패'); draws = res_list.count('무')
 
     summary_card = {
         '경기수': int(finished_mask.sum()),
         '승': wins,
         '패': losses,
         '무': draws,
-        '득점': int(team_games['away_score'][is_away].sum() + team_games['home_score'][is_home].sum()),
-        '실점': int(team_games['home_score'][is_away].sum() + team_games['away_score'][is_home].sum()),
-        '안타': int(team_games['away_hit'][is_away].sum() + team_games['home_hit'][is_home].sum()),
-        '홈런': int(team_games['away_hr'][is_away].sum() + team_games['home_hr'][is_home].sum()),
+        '득점': int(team_games['away_score'][is_away & finished_mask].sum()
+                    + team_games['home_score'][is_home  & finished_mask].sum()),
+        '실점': int(team_games['home_score'][is_away & finished_mask].sum()
+                    + team_games['away_score'][is_home  & finished_mask].sum()),
+        '안타': int(team_games['away_hit'][is_away & finished_mask].sum()
+                    + team_games['home_hit'][is_home  & finished_mask].sum()),
+        '홈런': int(team_games['away_hr'][is_away & finished_mask].sum()
+                    + team_games['home_hr'][is_home  & finished_mask].sum()),
     }
-
-    return jsonify({
-        "stadium": stadium,
-        "team": selected_team,
-        "summary": summary_card,
-        "games": team_games.sort_values("date", ascending=False).to_dict("records")
-    }), 200
-
-@app.route("/api/teams")
-def get_teams():
-    teams = ["LG", "두산", "키움", "SSG", "KT", "한화", "삼성", "KIA", "NC", "롯데"]
-    return jsonify(teams)
+    recent_games = team_games.sort_values("date", ascending=False).head(recent_n).to_dict("records")
+    return summary_card, recent_games
 
 @app.route("/api/team-summary")
 def team_summary_api():
@@ -314,34 +291,8 @@ def team_summary_api():
     df = load_latest_kbo_data()
     if df is None or not team:
         return jsonify({"error": "데이터가 없습니다."}), 400
-
-    team_games = df[(df['away_team'] == team) | (df['home_team'] == team)].copy()
-    is_away = (team_games['away_team'] == team)
-    is_home = (team_games['home_team'] == team)
-
-    team_result = np.where(is_home, team_games['home_result'], team_games['away_result'])
-    finished_mask = (team_result != '예정')
-
-    res_list = (
-        team_games.loc[is_away & finished_mask, 'away_result'].tolist()
-      + team_games.loc[is_home  & finished_mask, 'home_result'].tolist()
-    )
-    wins = res_list.count('승')
-    losses = res_list.count('패')
-    draws = res_list.count('무')
-
-    summary_card = {
-        '경기수': int(finished_mask.sum()),
-        '승': wins,
-        '패': losses,
-        '무': draws,
-        '득점': int(team_games['away_score'][is_away].sum() + team_games['home_score'][is_home].sum()),
-        '실점': int(team_games['home_score'][is_away].sum() + team_games['away_score'][is_home].sum()),
-        '안타': int(team_games['away_hit'][is_away].sum() + team_games['home_hit'][is_home].sum()),
-        '홈런': int(team_games['away_hr'][is_away].sum() + team_games['home_hr'][is_home].sum()),
-    }
-    recent_games = team_games.sort_values("date", ascending=False).head(10).to_dict("records")
-    return jsonify({"summary": summary_card, "games": recent_games})
+    summary, games = _summary_and_games(df, team)
+    return jsonify({"summary": summary, "games": games})
 
 @app.route("/api/stadium-summary")
 def stadium_summary_api():
@@ -351,53 +302,23 @@ def stadium_summary_api():
     df = load_latest_kbo_data()
     if df is None or not team or not stadium:
         return jsonify({"summary": None, "games": []})
-
-    mask_st = (df['stadium'] == stadium)
-    team_games = df[((df['away_team'] == team) | (df['home_team'] == team)) & mask_st].copy()
-    is_away = (team_games['away_team'] == team)
-    is_home = (team_games['home_team'] == team)
-
-    team_result = np.where(is_home, team_games['home_result'], team_games['away_result'])
-    finished_mask = (team_result != '예정')
-
-    res_list = (
-       team_games.loc[is_away & finished_mask, 'away_result'].tolist()
-     + team_games.loc[is_home  & finished_mask, 'home_result'].tolist()
-    )
-    wins = res_list.count('승')
-    losses = res_list.count('패')
-    draws = res_list.count('무')
-
-    summary_card = {
-        '경기수': int(finished_mask.sum()),
-        '승': wins,
-        '패': losses,
-        '무': draws,
-        '득점': int(team_games['away_score'][is_away].sum() + team_games['home_score'][is_home].sum()),
-        '실점': int(team_games['home_score'][is_away].sum() + team_games['away_score'][is_home].sum()),
-        '안타': int(team_games['away_hit'][is_away].sum() + team_games['home_hit'][is_home].sum()),
-        '홈런': int(team_games['away_hr'][is_away].sum() + team_games['home_hr'][is_home].sum()),
-    }
-    recent_games = team_games.sort_values("date", ascending=False).head(10).to_dict("records")
-    return jsonify({"summary": summary_card, "games": recent_games})
+    summary, games = _summary_and_games(df, team, stadium)
+    return jsonify({"summary": summary, "games": games})
 
 # =========================
-# 구장 차트 페이지
+# 구장 차트 페이지 (리액트에서 iframe으로 사용)
 # =========================
 @app.route("/stadium/<stadium>/chart")
 def stadium_chart(stadium):
+    stadium = _canonicalize_stadium_input(stadium)
+    selected_team = re.sub(r'\s+', '', (request.args.get("team") or ""))
+
     league_arr = [0.0, 0.0, 0.0]
     stadium_arr = [0.0, 0.0, 0.0]
     stadium_others_arr = [0.0, 0.0, 0.0]
     games = []
     summary_card = {'경기수':0,'승':0,'패':0,'무':0,'득점':0,'실점':0,'안타':0,'홈런':0}
 
-    try:
-        stadium = _canonicalize_stadium_input(stadium)
-    except Exception:
-        stadium = re.sub(r'\s+', '', stadium)
-
-    selected_team = re.sub(r'\s+', '', (request.args.get("team") or ""))
     df = load_latest_kbo_data()
     if df is None or not selected_team:
         return render_template(
@@ -413,10 +334,7 @@ def stadium_chart(stadium):
         )
 
     mask_st = (df['stadium'] == stadium)
-    team_games = df[
-        ((df['away_team'] == selected_team) | (df['home_team'] == selected_team)) & mask_st
-    ].copy()
-
+    team_games = df[((df['away_team']==selected_team)|(df['home_team']==selected_team)) & mask_st].copy()
     is_away = (team_games['away_team'] == selected_team)
     is_home = (team_games['home_team'] == selected_team)
 
@@ -424,22 +342,12 @@ def stadium_chart(stadium):
     finished_mask = (team_result != '예정')
 
     G = int(finished_mask.sum())
-
-    team_hit = int(
-        team_games.loc[is_away & finished_mask, 'away_hit'].sum()
-      + team_games.loc[is_home  & finished_mask, 'home_hit'].sum()
-    ) if G else 0
-
-    team_hr = int(
-        team_games.loc[is_away & finished_mask, 'away_hr'].sum()
-      + team_games.loc[is_home  & finished_mask, 'home_hr'].sum()
-    ) if G else 0
-
-    team_ab = int(
-        team_games.loc[is_away & finished_mask, 'away_ab'].sum()
-      + team_games.loc[is_home  & finished_mask, 'home_ab'].sum()
-    ) if G else 0
-
+    team_hit = int(team_games.loc[is_away & finished_mask, 'away_hit'].sum()
+                   + team_games.loc[is_home  & finished_mask, 'home_hit'].sum()) if G else 0
+    team_hr  = int(team_games.loc[is_away & finished_mask, 'away_hr'].sum()
+                   + team_games.loc[is_home  & finished_mask, 'home_hr'].sum()) if G else 0
+    team_ab  = int(team_games.loc[is_away & finished_mask, 'away_ab'].sum()
+                   + team_games.loc[is_home  & finished_mask, 'home_ab'].sum()) if G else 0
     team_avg = round(team_hit / team_ab, 4) if team_ab else 0.0
 
     stadium_arr = [
@@ -448,6 +356,7 @@ def stadium_chart(stadium):
         team_avg
     ]
 
+    # 리그 전체 평균
     rows = []
     for _, r in df.iterrows():
         rows.append({"team": r.get('away_team',''), "H": int(r.get('away_hit',0)),
@@ -469,6 +378,7 @@ def stadium_chart(stadium):
             round(H_sum / AB_sum, 4) if AB_sum else 0.0
         ]
 
+    # 동일 구장에서 '다른 팀들' 평균
     rows_st = []
     for _, r in df[mask_st].iterrows():
         rows_st.append({"team": r.get('away_team',''), "H": int(r.get('away_hit',0)),
@@ -484,7 +394,6 @@ def stadium_chart(stadium):
         H_sum_st  = int(others_at_st["H"].sum())  if apps_st else 0
         HR_sum_st = int(others_at_st["HR"].sum()) if apps_st else 0
         AB_sum_st = int(others_at_st["AB"].sum()) if apps_st else 0
-
         stadium_others_arr = [
             round(H_sum_st / apps_st, 4) if apps_st else 0.0,
             round(HR_sum_st / apps_st, 4) if apps_st else 0.0,
@@ -495,7 +404,7 @@ def stadium_chart(stadium):
         apps_st = 0
         others_team_count = 0
 
-    games = team_games.sort_values("date", ascending=False).to_dict(orient="records") if not team_games.empty else []
+    games = team_games.sort_values("date", ascending=False).to_dict("records") if not team_games.empty else []
 
     res_list = []
     res_list.extend(team_games.loc[is_home & finished_mask, 'home_result'].tolist())
@@ -527,74 +436,6 @@ def stadium_chart(stadium):
         others_apps_count=apps_st,
         others_team_count=others_team_count
     )
-
-# =========================
-# 디버그 & 관리
-# =========================
-@app.route("/_debug/count")
-def _debug_count():
-    t = re.sub(r'\s+', '', (request.args.get("team") or ""))
-    s = _canonicalize_stadium_input(request.args.get("stadium") or "")
-    df = load_latest_kbo_data()
-    if df is None:
-        return jsonify({"msg":"no data"})
-
-    sub = df[(((df['away_team']==t) | (df['home_team']==t)) & (df['stadium']==s))].copy()
-    if sub.empty:
-        return jsonify({"team": t, "stadium": s, "rows": 0})
-
-    is_home = (sub['home_team'] == t)
-    team_result = np.where(is_home, sub['home_result'], sub['away_result']).astype(str)
-    finished_mask = (team_result != '예정')
-
-    cnt = int(finished_mask.sum())
-    return jsonify({"team": t, "stadium": s, "rows": cnt})
-
-@app.route("/_debug/team_stadiums")
-def _debug_team_stadiums():
-    t = re.sub(r'\s+', '', (request.args.get("team") or ""))
-    df = load_latest_kbo_data()
-    if df is None:
-        return jsonify({"error":"no data"})
-    mask = (df['away_team'] == t) | (df['home_team'] == t)
-    sub = df[mask].copy()
-    counts = sub['stadium'].value_counts().to_dict()
-    sample = sub.head(20).to_dict(orient='records')
-    return jsonify({"team": t, "total_rows": int(sub.shape[0]), "by_stadium":counts,"sample": sample})
-
-@app.route("/_debug/raw_stadium_search")
-def _debug_raw_stadium_search():
-    q = (request.args.get("query") or "").strip()
-    used = LOCAL_CSV if os.path.exists(LOCAL_CSV) else None
-    if not used:
-        csv_files = [f for f in os.listdir('.') if f.startswith('kbo_games_') and f.endswith('.csv')]
-        csv_files.sort(reverse=True)
-        used = (csv_files[0] if csv_files else None)
-    info = {"used_file": used, "query": q, "matches": []}
-    if not used:
-        return jsonify({"error":"no csv found", **info})
-    try:
-        import csv
-        with open(used, 'r', encoding='utf-8-sig', errors='replace') as fh:
-            reader = csv.DictReader(fh)
-            i = 0
-            for row in reader:
-                i += 1
-                stad = row.get('stadium') or row.get('Stadium') or ''
-                full = "|".join([str(v) for v in row.values()])
-                if q and (q in stad or q in full):
-                    info["matches"].append({
-                        "row": i, "stadium_raw": stad,
-                        "away_team": row.get('away_team'),
-                        "home_team": row.get('home_team'),
-                        "date": row.get('date')
-                    })
-                if len(info["matches"]) >= 50:
-                    break
-        info["checked_rows"] = i
-    except Exception as e:
-        return jsonify({"error":"read failed", "exc": str(e), **info})
-    return jsonify(info)
 
 @app.get("/admin/refresh")
 def _admin_refresh():
