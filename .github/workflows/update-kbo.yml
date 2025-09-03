@@ -1,22 +1,27 @@
-name: Update KBO CSV daily
+name: Update KBO CSV
 
 on:
   workflow_dispatch:
     inputs:
       since:
-        description: "수집 시작일(YYYYMMDD)"
+        description: "수집 시작일(YYYYMMDD). 비우면 lookback 사용"
         required: false
         default: ""
       until:
-        description: "수집 종료일(YYYYMMDD, 미지정 시 어제)"
+        description: "수집 종료일(YYYYMMDD). 비우면 어제"
         required: false
         default: ""
       force_refresh:
-        description: "체크포인트 무시하고 새로 파싱"
+        description: "체크포인트 무시하고 강제 재수집"
         required: false
         default: "false"
+      clear_checkpoints:
+        description: "해당 기간 checkpoint/*.csv 삭제 후 수집"
+        required: false
+        default: "false"
+
   schedule:
-    # KST(+9) 기준 분산 3회 (UTC로 기입)
+    # KST(+9) 분산 3회 (UTC 기준)
     - cron: "40 14 * * *"   # 23:40 KST
     - cron: "10 16 * * *"   # 01:10 KST
     - cron: "20 18 * * *"   # 03:20 KST
@@ -34,8 +39,8 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
-      DEFAULT_LOOKBACK_DAYS: "5"      # 최근 5일
-      DEFAULT_UNTIL_OFFSET_DAYS: "1"  # 종료일 = 어제
+      DEFAULT_LOOKBACK_DAYS: "5"     # since 미지정 시 과거 N일
+      DEFAULT_UNTIL_OFFSET_DAYS: "1" # until 미지정 시 (어제)
 
     steps:
       - name: Checkout
@@ -47,7 +52,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
@@ -67,47 +71,138 @@ jobs:
         run: |
           IN_SINCE="${{ github.event.inputs.since }}"
           IN_UNTIL="${{ github.event.inputs.until }}"
+          # 기본값 계산
           YEST=$(date -d "-${DEFAULT_UNTIL_OFFSET_DAYS} day" +%Y%m%d)
-          SINCE_CALC=$(date -d "-${DEFAULT_LOOKBACK_DAYS} day" +%Y%m%d)
-          if [ -z "$IN_SINCE" ]; then SINCE="$SINCE_CALC"; else SINCE="$IN_SINCE"; fi
+          LOOKBACK=$(date -d "-${DEFAULT_LOOKBACK_DAYS} day" +%Y%m%d)
+
+          if [ -z "$IN_SINCE" ]; then SINCE="$LOOKBACK"; else SINCE="$IN_SINCE"; fi
           if [ -z "$IN_UNTIL" ]; then UNTIL="$YEST"; else UNTIL="$IN_UNTIL"; fi
+
           echo "since=$SINCE" >> $GITHUB_OUTPUT
           echo "until=$UNTIL" >> $GITHUB_OUTPUT
           echo "Resolved -> since=$SINCE until=$UNTIL"
 
-      - name: Prepare dirs (static/cache & data)
+      - name: Pre-check CSV
         run: |
-          mkdir -p static/cache
-          mkdir -p data
-
-      - name: Pre-check CSV (optional)
-        run: |
+          ls -lah
           ls -lah data || true
-          sed -n '1,8p' data/kbo_latest.csv || true
+          sed -n '1,5p' data/kbo_latest.csv || true
 
-      - name: Run crawler (headless)
-        # 실패 일시적일 수 있어 최대 2번 재시도
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 20
-          max_attempts: 2
-          command: |
-            set -e
-            SINCE="${{ steps.ds.outputs.since }}"
-            UNTIL="${{ steps.ds.outputs.until }}"
-            OUT="data/kbo_latest.csv"
-            FORCE="${{ github.event.inputs.force_refresh }}"
-            if [ "${FORCE}" = "true" ]; then EXTRA="--force_refresh"; else EXTRA=""; fi
-            python KBO_crawl.py --since "$SINCE" --until "$UNTIL" --out "$OUT" $EXTRA
-            echo "---- CSV HEAD ----"
-            sed -n '1,12p' "$OUT" || true
+      - name: Clear checkpoints in range (optional)
+        if: ${{ github.event.inputs.clear_checkpoints == 'true' }}
+        shell: bash
+        run: |
+          START="${{ steps.ds.outputs.since }}"
+          END="${{ steps.ds.outputs.until }}"
+          echo "Removing checkpoints from $START to $END"
+          mkdir -p checkpoints
+          d="$START"
+          while [ "$d" -le "$END" ]; do
+            rm -f "checkpoints/${d}.csv" || true
+            d=$(date -d "$d + 1 day" +%Y%m%d)
+          done
+          ls -lah checkpoints || true
+
+      - name: Run crawler (headless) and upsert CSV
+        shell: bash
+        run: |
+          set -e
+          SINCE="${{ steps.ds.outputs.since }}"
+          UNTIL="${{ steps.ds.outputs.until }}"
+          FORCE="${{ github.event.inputs.force_refresh }}"
+          OUT="data/kbo_latest.csv"
+
+          echo "[INFO] Running crawler for $SINCE..$UNTIL (force_refresh=$FORCE)"
+
+          python - << 'PY'
+          import os, sys, glob
+          import pandas as pd
+          from datetime import datetime, timedelta
+
+          # ---- inputs from env
+          SINCE = os.environ.get("SINCE")
+          UNTIL = os.environ.get("UNTIL")
+          FORCE = os.environ.get("FORCE","false").lower() == "true"
+          OUT   = os.environ.get("OUT", "data/kbo_latest.csv")
+
+          # ---- date list
+          def days(s, e):
+            d = datetime.strptime(s, "%Y%m%d").date()
+            u = datetime.strptime(e, "%Y%m%d").date()
+            cur = d
+            out = []
+            while cur <= u:
+              out.append(cur.strftime("%Y%m%d"))
+              cur += timedelta(days=1)
+            return out
+
+          dates = days(SINCE, UNTIL)
+
+          # ---- import crawler
+          sys.path.insert(0, ".")
+          from KBO_crawl import UltraPreciseKBOCrawler
+
+          crawler = UltraPreciseKBOCrawler()
+          try:
+              df = crawler.crawl_kbo_games(dates, checkpoint_dir="checkpoints", force_refresh=FORCE)
+              # ensure numeric & schema
+              cols = ["date","stadium","away_team","home_team","away_score","home_score",
+                      "away_result","home_result","away_hit","home_hit","away_hr","home_hr",
+                      "away_ab","home_ab"]
+              for c in ["away_hit","home_hit","away_hr","home_hr","away_ab","home_ab",
+                        "away_score","home_score"]:
+                  if c in df.columns:
+                      df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+              # 타율 계산
+              df["away_avg"] = (df["away_hit"]/df["away_ab"]).where(df["away_ab"]>0, 0.0)
+              df["home_avg"] = (df["home_hit"]/df["home_ab"]).where(df["home_ab"]>0, 0.0)
+              keep = ["date","stadium","away_team","home_team","away_score","home_score",
+                      "away_result","home_result","away_hit","home_hit","away_hr","home_hr",
+                      "away_ab","home_ab","away_avg","home_avg"]
+              df = df[keep].copy()
+
+              # ---- upsert into OUT (remove rows within range and append)
+              os.makedirs(os.path.dirname(OUT), exist_ok=True)
+              if os.path.exists(OUT):
+                  old = pd.read_csv(OUT, encoding="utf-8-sig")
+              else:
+                  old = pd.DataFrame(columns=keep)
+
+              # 같은 스키마 보장
+              for c in keep:
+                  if c not in old.columns: old[c] = pd.Series([None]*len(old))
+              old = old[keep]
+
+              # 날짜 비교는 yyyy-mm-dd
+              dmin = min(d["date"] for _,d in df.iterrows()) if not df.empty else None
+              dmax = max(d["date"] for _,d in df.iterrows()) if not df.empty else None
+
+              # 제거 범위: SINCE~UNTIL
+              mask = (pd.to_datetime(old["date"])>=pd.to_datetime(datetime.strptime(SINCE,"%Y%m%d")))
+              mask &= (pd.to_datetime(old["date"])<=pd.to_datetime(datetime.strptime(UNTIL,"%Y%m%d")))
+              kept = old.loc[~mask].copy()
+
+              out_df = pd.concat([kept, df], ignore_index=True)
+              out_df = out_df.sort_values(["date","stadium","away_team","home_team"]).reset_index(drop=True)
+              out_df.to_csv(OUT, index=False, encoding="utf-8-sig")
+              print(f"[INFO] upserted {len(df)} rows -> {OUT}")
+          finally:
+              crawler.cleanup()
+          PY
+
+          echo "---- CSV HEAD ----"
+          sed -n '1,12p' "$OUT" || true
+          echo "---- TAIL 12 ----"
+          tail -n 12 "$OUT" || true
+          echo "---- GREP $UNTIL ----"
+          grep "^$(echo $UNTIL | sed 's/\\(..\\)\\(..\\)$/-\\1-\\2/; s/^\\(....\\)/\\1-/' )" "$OUT" || true
 
       - name: Commit CSV if changed
         id: commit
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/kbo_latest.csv
+          git add data/kbo_latest.csv checkpoints || true
           if git diff --cached --quiet; then
             echo "changes=false" >> $GITHUB_OUTPUT
             echo "No changes to commit."
@@ -125,6 +220,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kbo-csv
-          path: data/kbo_latest.csv
+          path: |
+            data/kbo_latest.csv
+            checkpoints/*
           if-no-files-found: ignore
 
