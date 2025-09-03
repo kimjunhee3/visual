@@ -133,35 +133,34 @@ class UltraPreciseKBOCrawler:
             shutil.rmtree(self._tmp_profile, ignore_errors=True)
 
     # --------------- list page helpers ---------------
-    def _extract_one_game_from_list(self, li, url_date_yyyymmdd: str) -> dict | None:
+        def _extract_one_game_from_list(self, li, url_date_yyyymmdd: str) -> dict | None:
         """리스트에 있는 한 경기 블록에서 기본 정보 추출"""
         try:
             game_id = li.get("g_id") or li.get("gid") or ""
             game_date = li.get("g_dt") or url_date_yyyymmdd
             date_iso = _yyyymmdd_to_iso(game_date)
 
-            # 점수 (li 내부에서만 탐색)
+            # 점수
             away_score, home_score = 0, 0
-            sc_away = li.select_one(".team.away .score")
-            sc_home = li.select_one(".team.home .score")
-            if sc_away and _norm(sc_away.get_text()).isdigit():
-                away_score = int(_norm(sc_away.get_text()))
-            if sc_home and _norm(sc_home.get_text()).isdigit():
-                home_score = int(_norm(sc_home.get_text()))
+            sc_away_el = li.select_one(".team.away .score")
+            sc_home_el = li.select_one(".team.home .score")
+            if sc_away_el:
+                txt = _norm(sc_away_el.get_text())
+                if txt.isdigit():
+                    away_score = int(txt)
+            if sc_home_el:
+                txt = _norm(sc_home_el.get_text())
+                if txt.isdigit():
+                    home_score = int(txt)
 
-            # 종료/예정 상태 판단
-            status = _norm((li.get("class") or [""])[-1])  # 'end', 'play', 'scheduled' 등
-            if "end" in li.get("class", []):
-                end_flag = True
-            elif "play" in li.get("class", []):
-                end_flag = False
-            else:
-                # 점수 둘 다 0이면 보수적으로 예정 처리
-                end_flag = not (away_score == 0 and home_score == 0)
+            # 종료 여부
+            end_flag = "end" in (li.get("class") or [])
 
             # 팀 이름
-            away_name = li.get("away_nm") or _norm((li.select_one(".team.away .name") or {}).get_text())
-            home_name = li.get("home_nm") or _norm((li.select_one(".team.home .name") or {}).get_text())
+            away_nm_el = li.select_one(".team.away .name")
+            home_nm_el = li.select_one(".team.home .name")
+            away_name = li.get("away_nm") or (_norm(away_nm_el.get_text()) if away_nm_el else "")
+            home_name = li.get("home_nm") or (_norm(home_nm_el.get_text()) if home_nm_el else "")
 
             def result_for(is_away: bool) -> str:
                 if not end_flag:
@@ -173,8 +172,8 @@ class UltraPreciseKBOCrawler:
                 else:
                     return "승" if home_score > away_score else "패"
 
-            # 구장
-            stadium = _norm((li.select_one(".place") or {}).get_text())
+            stadium_el = li.select_one(".place")
+            stadium = _norm(stadium_el.get_text()) if stadium_el else ""
 
             return {
                 "raw_date": game_date,
