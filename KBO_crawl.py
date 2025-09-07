@@ -43,6 +43,19 @@ def _retry(n: int, delay: float, fn, *args, **kwargs):
             time.sleep(delay)
     raise last if last else RuntimeError("retry failed")
 
+def _clean_stadium_name(s: str) -> str:
+    """
+    '구장:', '장소:', '경기장:' 같은 접두어/콜론을 제거하고,
+    뒤쪽 괄호 부가정보도 제거해 깔끔한 구장명만 남긴다.
+    """
+    t = _norm(s)
+    if not t:
+        return ""
+    t = re.sub(r"^(구장|장소|경기장)\s*[:：]\s*", "", t)
+    t = re.sub(r"\s*\([^()]*\)\s*$", "", t)  # 끝의 (부가정보) 제거
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
 # ---------------------- crawler ----------------------
 class UltraPreciseKBOCrawler:
     def __init__(self, headless: bool = True):
@@ -210,6 +223,9 @@ class UltraPreciseKBOCrawler:
                     if el:
                         stadium = _norm(el.get_text()); break
 
+            # ✅ 접두어/괄호 제거해서 이름만 남기기
+            stadium = _clean_stadium_name(stadium)
+
             return {
                 "raw_date": game_date,
                 "date": date_iso,
@@ -258,6 +274,9 @@ class UltraPreciseKBOCrawler:
                 el = soup.select_one(sel)
                 if el:
                     stadium_review = _norm(el.get_text()); break
+
+            # ✅ 정리 적용
+            stadium_review = _clean_stadium_name(stadium_review)
 
             away_hit, home_hit = self._extract_hits(soup)
             away_hr,  home_hr  = self._extract_hrs_with_fallback(soup)
