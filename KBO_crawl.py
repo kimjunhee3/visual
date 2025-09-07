@@ -45,14 +45,14 @@ def _retry(n: int, delay: float, fn, *args, **kwargs):
 
 def _clean_stadium_name(s: str) -> str:
     """
-    '구장:', '장소:', '경기장:' 같은 접두어/콜론을 제거하고,
-    뒤쪽 괄호 부가정보도 제거해 깔끔한 구장명만 남긴다.
+    '구장:', '장소:', '경기장:' 같은 접두어/콜론 제거 +
+    끝의 괄호 부가정보 제거 → 깔끔한 구장명만 남김
     """
     t = _norm(s)
     if not t:
         return ""
     t = re.sub(r"^(구장|장소|경기장)\s*[:：]\s*", "", t)
-    t = re.sub(r"\s*\([^()]*\)\s*$", "", t)  # 끝의 (부가정보) 제거
+    t = re.sub(r"\s*\([^()]*\)\s*$", "", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
@@ -223,7 +223,7 @@ class UltraPreciseKBOCrawler:
                     if el:
                         stadium = _norm(el.get_text()); break
 
-            # ✅ 접두어/괄호 제거해서 이름만 남기기
+            # 이름만 남기기
             stadium = _clean_stadium_name(stadium)
 
             return {
@@ -275,7 +275,6 @@ class UltraPreciseKBOCrawler:
                 if el:
                     stadium_review = _norm(el.get_text()); break
 
-            # ✅ 정리 적용
             stadium_review = _clean_stadium_name(stadium_review)
 
             away_hit, home_hit = self._extract_hits(soup)
@@ -470,8 +469,11 @@ def days_append_mode(out_csv: str, since_arg: str | None, until_arg: str | None)
     print(f"[INFO] append-mode 수집 범위: {since}..{until}")
     return out
 
-# ---------------------- append writer ----------------------
-def append_csv(out_csv: str, new_rows: list[dict]):
+# ---------------------- upsert writer ----------------------
+def append_csv(out_csv: str, new_rows: list[dict], since: str | None = None, until: str | None = None):
+    """
+    기존 CSV에 덧붙이되, since..until 구간은 먼저 제거하고 새 데이터로 교체(업서트).
+    """
     os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
     new_df = pd.DataFrame(new_rows)
     cols = [
@@ -491,18 +493,20 @@ def append_csv(out_csv: str, new_rows: list[dict]):
             if c not in old.columns:
                 old[c] = pd.Series([None]*len(old))
         old = old[cols]
-        if not old.empty:
-            max_old = pd.to_datetime(old["date"]).max()
-            if not pd.isna(max_old):
-                cutoff = max_old.strftime("%Y-%m-%d")
-                new_df = new_df[pd.to_datetime(new_df["date"]) > pd.to_datetime(cutoff)]
+
+        # 겹치는 날짜 범위 제거 후 새 데이터 삽입
+        if since and until and not old.empty:
+            s_iso = _yyyymmdd_to_iso(since)
+            u_iso = _yyyymmdd_to_iso(until)
+            mask = (pd.to_datetime(old["date"]) < pd.to_datetime(s_iso)) | (pd.to_datetime(old["date"]) > pd.to_datetime(u_iso))
+            old = old.loc[mask]
         out = pd.concat([old, new_df], ignore_index=True)
     else:
         out = new_df
 
     out = out.sort_values(["date","stadium","away_team","home_team"]).reset_index(drop=True)
     out.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"[INFO] appended {len(new_df)} rows -> {out_csv}")
+    print(f"[INFO] upserted {len(new_df)} rows -> {out_csv}")
 
 # ---------------------- CLI main ----------------------
 def main():
@@ -525,7 +529,8 @@ def main():
         df = crawler.crawl_kbo_games(rng, force_refresh=force_refresh)
         rows = df.to_dict("records")
         if rows:
-            append_csv(args.out, rows)
+            # since..until 범위를 넘겨서 해당 구간을 교체(업서트)
+            append_csv(args.out, rows, since=rng[0], until=rng[-1])
         else:
             print("[INFO] 신규 행 없음")
     finally:
