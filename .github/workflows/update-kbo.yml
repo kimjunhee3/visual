@@ -4,22 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       since:
-        description: "시작일(YYYYMMDD), 비우면 DEFAULT_SINCE"
+        description: "시작일(YYYYMMDD) — 비워두면 CSV 마지막+1일부터 자동"
         required: false
         default: ""
       until:
-        description: "종료일(YYYYMMDD), 비우면 어제"
+        description: "종료일(YYYYMMDD) — 비워두면 어제"
         required: false
         default: ""
       force:
-        description: "체크포인트 무시하고 다시 수집할지 (true/false)"
+        description: "체크포인트 무시 후 재수집할지 (true/false)"
         required: false
         default: "false"
   schedule:
-    # KST(+9) 기준 00:40 / 02:10 / 03:20 (UTC)
-    - cron: "40 15 * * *"
+    # KST(+9) 기준 02:10 
     - cron: "10 17 * * *"
-    - cron: "20 19 * * *"
+ 
 
 permissions:
   contents: write
@@ -54,9 +53,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install selenium beautifulsoup4 pandas
+          pip install selenium beautifulsoup4 lxml pandas
 
-      - name: Resolve dates
+      - name: Resolve inputs
         id: ds
         shell: bash
         run: |
@@ -67,7 +66,7 @@ jobs:
           echo "until=$IN_UNTIL"  >> $GITHUB_OUTPUT
           echo "force=$FORCE"     >> $GITHUB_OUTPUT
 
-      - name: Run crawler (headless)
+      - name: Run crawler (append-mode aware)
         run: |
           set -e
           python KBO_crawl.py \
@@ -93,3 +92,4 @@ jobs:
       - name: Push
         if: steps.commit.outputs.changes == 'true'
         run: git push
+
