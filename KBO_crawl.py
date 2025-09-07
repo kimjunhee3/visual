@@ -27,7 +27,6 @@ def _yyyymmdd_to_iso(yyyymmdd: str) -> str:
     return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
 
 def _iso_to_yyyymmdd(iso: str) -> str:
-    # iso: YYYY-MM-DD
     return iso.replace("-", "")
 
 def _to_int(s: str) -> int:
@@ -381,7 +380,7 @@ class UltraPreciseKBOCrawler:
                 for td in tr.find_all("td"):
                     t = _norm(td.get_text())
                     if not t: continue
-                    if any(x in t for x in EXCLUDE): 
+                    if any(x in t for x in EXCLUDE):
                         continue
                     if "홈" in t and "홈인" not in t:
                         ab += 1; continue
@@ -408,7 +407,6 @@ def _max_date_in_csv(out_csv: str) -> str | None:
         df = pd.read_csv(out_csv, encoding="utf-8-sig")
         if "date" not in df.columns or df.empty:
             return None
-        # 'date'가 ISO(YYYY-MM-DD)이므로 변환
         mx = pd.to_datetime(df["date"]).max()
         if pd.isna(mx):
             return None
@@ -457,7 +455,6 @@ def days_append_mode(out_csv: str, since_arg: str | None, until_arg: str | None)
 def append_csv(out_csv: str, new_rows: list[dict]):
     os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
     new_df = pd.DataFrame(new_rows)
-    # 스키마 정렬
     cols = [
         "date","stadium","away_team","home_team",
         "away_score","home_score","away_result","home_result",
@@ -475,7 +472,6 @@ def append_csv(out_csv: str, new_rows: list[dict]):
             if c not in old.columns:
                 old[c] = pd.Series([None]*len(old))
         old = old[cols]
-        # append 전, 혹시 겹치는 날짜가 있을 경우(수동으로 since를 뒤로 준 경우) 뒤쪽만 유지
         if not old.empty:
             max_old = pd.to_datetime(old["date"]).max()
             if not pd.isna(max_old):
