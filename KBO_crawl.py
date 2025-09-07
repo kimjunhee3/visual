@@ -1,17 +1,12 @@
 # KBO_crawl.py
-import os
-import re
-import time
-import json
-import shutil
-import tempfile
+import os, re, time, json, shutil, tempfile
 from datetime import datetime, timedelta
 
 import pandas as pd
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
-from selenium.common.exceptions import SessionNotCreatedException
+from selenium.common.exceptions import SessionNotCreatedException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -20,7 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 DEFAULT_SINCE = "20250322"
 
 SCHEDULE_DAY_URL = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameDate={d}"
-REVIEW_URL = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameId={gid}&gameDate={gdt}&section=REVIEW"
+REVIEW_URL       = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameId={gid}&gameDate={gdt}&section=REVIEW"
 
 # ---------------------- util ----------------------
 def _norm(s: str | None) -> str:
@@ -31,9 +26,23 @@ def _norm(s: str | None) -> str:
 def _yyyymmdd_to_iso(yyyymmdd: str) -> str:
     return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
 
+def _iso_to_yyyymmdd(iso: str) -> str:
+    # iso: YYYY-MM-DD
+    return iso.replace("-", "")
+
 def _to_int(s: str) -> int:
     m = re.search(r"\d+", s or "")
     return int(m.group()) if m else 0
+
+def _retry(n: int, delay: float, fn, *args, **kwargs):
+    last = None
+    for _ in range(n):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            time.sleep(delay)
+    raise last if last else RuntimeError("retry failed")
 
 # ---------------------- crawler ----------------------
 class UltraPreciseKBOCrawler:
@@ -45,19 +54,14 @@ class UltraPreciseKBOCrawler:
     def _setup_driver(self, headless: bool):
         opts = Options()
         if headless:
-            # GitHub Actions에서 오류 적은 최신 headless
             opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
         opts.add_argument("--window-size=1920,1080")
         opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-        # 세션 충돌 방지: 매 실행마다 임시 프로필
         self._tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
         opts.add_argument(f"--user-data-dir={self._tmp_profile}")
-
-        # 몇몇 환경에서 sandbox 문제 회피
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
 
@@ -90,10 +94,10 @@ class UltraPreciseKBOCrawler:
 
             try:
                 self.driver.get(SCHEDULE_DAY_URL.format(d=d))
-                time.sleep(2)
+                _retry(3, 1.0, self._wait_list_loaded)
+
                 soup = BeautifulSoup(self.driver.page_source, "html.parser")
                 games = soup.select("li.game-cont")
-                # 경기 없는 날 스킵
                 if not games:
                     print(f"  └ {d}: 경기 없음 → 스킵")
                     continue
@@ -103,10 +107,16 @@ class UltraPreciseKBOCrawler:
                     gi = self._extract_one_game_from_list(li, d)
                     if not gi:
                         continue
-                    # 종료 경기만 리뷰 파싱
+
+                    # 종료 경기만 리뷰 파싱(리뷰 버튼이 보이면 종료로 간주)
                     if gi["away_result"] in ("승", "패", "무") and gi.get("game_id"):
-                        detail = self._fetch_review_detail(gi["game_id"], gi["raw_date"], gi["away_team"], gi["home_team"])
+                        detail = _retry(3, 1.0, self._fetch_review_detail,
+                                        gi["game_id"], gi["raw_date"], gi["away_team"], gi["home_team"])
+                        # 목록에서 못 구한 구장명은 리뷰에서 보강
+                        if (not gi.get("stadium")) and detail.get("stadium_review"):
+                            gi["stadium"] = detail["stadium_review"]
                         gi.update(detail)
+
                     day_rows.append(gi)
 
                 if day_rows:
@@ -119,9 +129,22 @@ class UltraPreciseKBOCrawler:
                 print(f"[WARN] {d} 처리 실패:", e)
                 continue
 
-            time.sleep(1.5)
+            time.sleep(1.2)
 
         return pd.DataFrame(results)
+
+    def _wait_list_loaded(self):
+        try:
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li.game-cont"))
+            )
+        except TimeoutException:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li.game-cont"))
+            )
+        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(0.5)
 
     def cleanup(self):
         if self.driver:
@@ -134,29 +157,33 @@ class UltraPreciseKBOCrawler:
 
     # --------------- list page helpers ---------------
     def _extract_one_game_from_list(self, li, url_date_yyyymmdd: str) -> dict | None:
-        """리스트에 있는 한 경기 블록에서 기본 정보 추출"""
         try:
-            game_id = li.get("g_id") or li.get("gid") or ""
+            # gameId / gameDate 우선 확보
+            game_id  = li.get("g_id") or li.get("gid") or ""
             game_date = li.get("g_dt") or url_date_yyyymmdd
+
+            # 리뷰 링크가 있으면 href에서 보정
+            a_review = li.select_one("a#btnReview, a[href*='section=REVIEW']")
+            if a_review and a_review.has_attr("href"):
+                href = a_review["href"]
+                gid  = re.search(r"gameId=([0-9A-Z]+)", href)
+                gdt  = re.search(r"gameDate=(\d{8})", href)
+                if gid: game_id = gid.group(1)
+                if gdt: game_date = gdt.group(1)
+
             date_iso = _yyyymmdd_to_iso(game_date)
 
             # 점수
-            away_score, home_score = 0, 0
-            sc_away_el = li.select_one(".team.away .score")
-            sc_home_el = li.select_one(".team.home .score")
-            if sc_away_el:
-                txt = _norm(sc_away_el.get_text())
-                if txt.isdigit():
-                    away_score = int(txt)
-            if sc_home_el:
-                txt = _norm(sc_home_el.get_text())
-                if txt.isdigit():
-                    home_score = int(txt)
+            def _score(sel):
+                el = li.select_one(sel)
+                t  = _norm(el.get_text()) if el else ""
+                return int(t) if t.isdigit() else 0
+            away_score = _score(".team.away .score")
+            home_score = _score(".team.home .score")
 
-            # 종료 여부
-            end_flag = "end" in (li.get("class") or [])
+            # 종료 판정: class end 또는 리뷰 버튼 유무
+            end_flag = ("end" in (li.get("class") or [])) or (a_review is not None)
 
-            # 팀 이름
             away_nm_el = li.select_one(".team.away .name")
             home_nm_el = li.select_one(".team.home .name")
             away_name = li.get("away_nm") or (_norm(away_nm_el.get_text()) if away_nm_el else "")
@@ -172,8 +199,17 @@ class UltraPreciseKBOCrawler:
                 else:
                     return "승" if home_score > away_score else "패"
 
-            stadium_el = li.select_one(".place")
-            stadium = _norm(stadium_el.get_text()) if stadium_el else ""
+            # 구장명: 속성/여러 후보 셀렉터 순차 시도
+            stadium = ""
+            for attr in ("stadium", "place", "data-stadium", "data-place"):
+                v = li.get(attr)
+                if v:
+                    stadium = _norm(v); break
+            if not stadium:
+                for sel in [".place", ".info .place", ".stadium", ".ballpark", "span.place", "p.place"]:
+                    el = li.select_one(sel)
+                    if el:
+                        stadium = _norm(el.get_text()); break
 
             return {
                 "raw_date": game_date,
@@ -193,9 +229,7 @@ class UltraPreciseKBOCrawler:
 
     # --------------- review page helpers ---------------
     def _ensure_review_tab(self) -> bool:
-        """리뷰 탭이 활성화되도록 시도"""
         try:
-            # 이미 REVIEW면 on 클래스가 있음
             on = self.driver.find_elements(By.XPATH, "//li[@section='REVIEW' and contains(@class,'on')]")
             if on:
                 return True
@@ -203,41 +237,47 @@ class UltraPreciseKBOCrawler:
                 EC.element_to_be_clickable((By.XPATH, "//li[@section='REVIEW']//a"))
             )
             tab.click()
-            time.sleep(1.5)
+            time.sleep(1.0)
             return True
         except Exception:
             return False
 
     def _fetch_review_detail(self, game_id: str, gdt_yyyymmdd: str, away_team: str, home_team: str) -> dict:
-        """리뷰 페이지에서 H, HR, AB 계산"""
         try:
             self.driver.get(REVIEW_URL.format(gid=game_id, gdt=gdt_yyyymmdd))
-            time.sleep(2)
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#tblScoreboard3, #tblAwayHitter3"))
+            )
             self._ensure_review_tab()
-            time.sleep(1)
+            time.sleep(0.8)
             soup = BeautifulSoup(self.driver.page_source, "html.parser")
 
-            away_hit, home_hit = self._extract_hits(soup)
-            away_hr, home_hr = self._extract_hrs_with_fallback(soup)
-            away_ab, home_ab = self._extract_ab_with_fallback(soup)
+            # 구장명 fallback
+            stadium_review = ""
+            for sel in ["#txtStadium", "#txtStadium1", "#txtStadium2",
+                        ".st_name", ".stadium", ".ballpark", ".park"]:
+                el = soup.select_one(sel)
+                if el:
+                    stadium_review = _norm(el.get_text()); break
 
-            # 타율
+            away_hit, home_hit = self._extract_hits(soup)
+            away_hr,  home_hr  = self._extract_hrs_with_fallback(soup)
+            away_ab,  home_ab  = self._extract_ab_with_fallback(soup)
+
             away_avg = round(away_hit / away_ab, 4) if away_ab else 0.0
             home_avg = round(home_hit / home_ab, 4) if home_ab else 0.0
 
             return {
-                "away_hit": away_hit,
-                "home_hit": home_hit,
-                "away_hr": away_hr,
-                "home_hr": home_hr,
-                "away_ab": away_ab,
-                "home_ab": home_ab,
-                "away_avg": away_avg,
-                "home_avg": home_avg,
+                "stadium_review": stadium_review,
+                "away_hit": away_hit, "home_hit": home_hit,
+                "away_hr": away_hr,   "home_hr": home_hr,
+                "away_ab": away_ab,   "home_ab": home_ab,
+                "away_avg": away_avg, "home_avg": home_avg,
             }
         except Exception as e:
             print("  └ 리뷰 상세 파싱 실패:", e)
             return {
+                "stadium_review": "",
                 "away_hit": 0, "home_hit": 0,
                 "away_hr": 0, "home_hr": 0,
                 "away_ab": 0, "home_ab": 0,
@@ -246,24 +286,19 @@ class UltraPreciseKBOCrawler:
 
     # ----- H, HR, AB 추출 -----
     def _extract_hits(self, soup: BeautifulSoup) -> tuple[int, int]:
-        """Scoreboard3의 H열 → 실패 시 Hitter3 tfoot 2열"""
         away_hit = home_hit = 0
-
         sb3 = soup.select_one("#tblScoreboard3")
         if sb3:
-            heads = [ _norm(th.get_text()) for th in sb3.select("thead th") ]
+            heads = [_norm(th.get_text()) for th in sb3.select("thead th")]
             if "H" in heads:
                 h_idx = heads.index("H")
                 rows = sb3.select("tbody tr")
                 if len(rows) >= 2:
                     a_cells = rows[0].find_all("td")
                     h_cells = rows[1].find_all("td")
-                    if len(a_cells) > h_idx and _norm(a_cells[h_idx].get_text()).isdigit():
-                        away_hit = int(_norm(a_cells[h_idx].get_text()))
-                    if len(h_cells) > h_idx and _norm(h_cells[h_idx].get_text()).isdigit():
-                        home_hit = int(_norm(h_cells[h_idx].get_text()))
+                    if len(a_cells) > h_idx: away_hit = _to_int(a_cells[h_idx].get_text())
+                    if len(h_cells) > h_idx: home_hit = _to_int(h_cells[h_idx].get_text())
         if away_hit == 0 and home_hit == 0:
-            # fallback: Hitter3 tfoot → 두 번째 td가 H
             a = soup.select_one("#tblAwayHitter3 tfoot tr")
             h = soup.select_one("#tblHomeHitter3 tfoot tr")
             if a:
@@ -275,51 +310,42 @@ class UltraPreciseKBOCrawler:
         return away_hit, home_hit
 
     def _count_hr_in_hitter2(self, soup: BeautifulSoup, home: bool) -> int:
-        """
-        히터2 테이블에서 '홈'이 들어간 셀(좌홈, 좌중홈, 우홈 등)을 모두 홈런으로 집계.
-        (한 셀에 홈런이 2개 들어갈 일은 없으므로 단순히 '홈' 포함 여부로 카운트)
-        """
         table_id = "#tblHomeHitter2" if home else "#tblAwayHitter2"
         tbody = soup.select_one(f"{table_id} tbody")
         if not tbody:
-            return -1  # 실패
+            return -1
         cnt = 0
         for tr in tbody.select("tr"):
             for td in tr.find_all("td"):
                 t = _norm(td.get_text())
-                # 홈런 표기: '좌중홈', '좌홈', '우중홈' 등 → '홈' 포함
-                # '홈인' 등의 수비/주루 이벤트는 히터2에 거의 나타나지 않지만 방지 차원으로 예외 처리
+                if not t:
+                    continue
                 if "홈" in t and "홈인" not in t:
-                    cnt += t.count("홈") if "홈런" not in t else 1
+                    n = _to_int(t)
+                    cnt += n if n > 0 else 1
         return cnt
 
     def _extract_hrs_with_fallback(self, soup: BeautifulSoup) -> tuple[int, int]:
-        """히터2 우선, 실패 시 요약(#tblEtc)+투수표로 보정"""
         home_hr = self._count_hr_in_hitter2(soup, home=True)
         away_hr = self._count_hr_in_hitter2(soup, home=False)
         if home_hr >= 0 and away_hr >= 0:
             return away_hr, home_hr
 
-        # fallback: 요약표에 '홈런' 문구 + 투수 소속으로 팀 판별
-        away_pitchers = { _norm(tds[0].get_text())
-                          for tr in soup.select("#tblAwayPitcher tbody tr")
-                          if (tds := tr.find_all("td")) }
-        home_pitchers = { _norm(tds[0].get_text())
-                          for tr in soup.select("#tblHomePitcher tbody tr")
-                          if (tds := tr.find_all("td")) }
+        away_pitchers = {_norm(tds[0].get_text())
+                         for tr in soup.select("#tblAwayPitcher tbody tr")
+                         if (tds := tr.find_all("td"))}
+        home_pitchers = {_norm(tds[0].get_text())
+                         for tr in soup.select("#tblHomePitcher tbody tr")
+                         if (tds := tr.find_all("td"))}
 
         a_hr = h_hr = 0
         etc = soup.select_one("#tblEtc")
         if etc:
             for tr in etc.select("tr"):
                 th = tr.find("th"); td = tr.find("td")
-                if not th or not td: 
-                    continue
-                if "홈런" not in _norm(th.get_text()):
+                if not th or not td or "홈런" not in _norm(th.get_text()):
                     continue
                 text = _norm(td.get_text())
-                # 괄호 안 마지막 토큰을 투수명으로 가정
-                # 예: "장성우 11호(2점 5회1,2루 강보라 윤영빈) 장준원 1호(7회1점 윤영빈)"
                 for p in re.findall(r"\([^)]* ([가-힣A-Za-z0-9]+)\)", text):
                     if p in away_pitchers:
                         h_hr += 1
@@ -330,15 +356,9 @@ class UltraPreciseKBOCrawler:
         return away_hr, home_hr
 
     def _extract_ab_with_fallback(self, soup: BeautifulSoup) -> tuple[int, int]:
-        """
-        우선 Hitter3 tfoot 첫 번째 칸(타수) 사용.
-        없으면 Hitter2의 각 타자의 이벤트를 이용해 AB 추정:
-        - 안타/홈/아웃 등 타수로 잡히는 이벤트 개수 합
-        """
         def from_hitter3(home: bool) -> int:
             t = soup.select_one("#tblHomeHitter3 tfoot tr" if home else "#tblAwayHitter3 tfoot tr")
-            if not t:
-                return -1
+            if not t: return -1
             tds = t.find_all("td")
             return _to_int(tds[0].get_text()) if tds else -1
 
@@ -347,6 +367,10 @@ class UltraPreciseKBOCrawler:
         if home_ab >= 0 and away_ab >= 0:
             return away_ab, home_ab
 
+        EXCLUDE = ("4구", "볼넷", "사구", "고의4구", "고의사구", "희비", "희플", "희번트", "희타")
+        HIT_PAT = re.compile(r"(안타|좌안|중안|우안)")
+        OUT_PAT = re.compile(r"(땅|뜬|삼진|파|직|수비|병살)")
+
         def estimate_from_hitter2(home: bool) -> int:
             table_id = "#tblHomeHitter2" if home else "#tblAwayHitter2"
             tbody = soup.select_one(f"{table_id} tbody")
@@ -354,20 +378,14 @@ class UltraPreciseKBOCrawler:
                 return 0
             ab = 0
             for tr in tbody.select("tr"):
-                # 선수명 이후의 셀들이 타석 이벤트
-                tds = tr.find_all("td")
-                if not tds:
-                    continue
-                # 첫 번째 혹은 두 번째 셀에 선수명이 있어 구조가 가변 → 뒤쪽만 이벤트로 간주
-                # 실제 AB 판정: 히트/아웃/홈(=HR)만 카운트 (볼넷/사구/희비/희플 제외)
-                for td in tds:
+                for td in tr.find_all("td"):
                     t = _norm(td.get_text())
-                    if not t or t == "&nbsp;":
+                    if not t: continue
+                    if any(x in t for x in EXCLUDE): 
                         continue
-                    if ("4구" in t) or ("사구" in t) or ("희비" in t) or ("희플" in t):
-                        continue
-                    # 홈 포함(홈런) 또는 '안타'(안타), 혹은 일반 '땅볼/뜬공/삼진' 등 타수 소모
-                    if ("홈" in t) or ("안타" in t) or re.search(r"(땅|뜬|삼진|중안|좌안|우안)", t):
+                    if "홈" in t and "홈인" not in t:
+                        ab += 1; continue
+                    if HIT_PAT.search(t) or OUT_PAT.search(t):
                         ab += 1
             return ab
 
@@ -375,68 +393,124 @@ class UltraPreciseKBOCrawler:
         if home_ab < 0: home_ab = estimate_from_hitter2(True)
         return away_ab, home_ab
 
-# ---------------------- CLI main ----------------------
-def days(since: str | None, until: str | None) -> list[str]:
-    """YYYYMMDD 범위를 리스트로 반환"""
-    if not since:
-        since = DEFAULT_SINCE
-    if not until:
-        until = (datetime.today() - timedelta(days=1)).strftime("%Y%m%d")
+# ---------------------- date helpers ----------------------
+def _yesterday_yyyymmdd() -> str:
+    return (datetime.today() - timedelta(days=1)).strftime("%Y%m%d")
+
+def _next_day(yyyymmdd: str) -> str:
+    d = datetime.strptime(yyyymmdd, "%Y%m%d").date() + timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+def _max_date_in_csv(out_csv: str) -> str | None:
+    if not os.path.exists(out_csv):
+        return None
+    try:
+        df = pd.read_csv(out_csv, encoding="utf-8-sig")
+        if "date" not in df.columns or df.empty:
+            return None
+        # 'date'가 ISO(YYYY-MM-DD)이므로 변환
+        mx = pd.to_datetime(df["date"]).max()
+        if pd.isna(mx):
+            return None
+        return mx.strftime("%Y%m%d")
+    except Exception:
+        return None
+
+def days_append_mode(out_csv: str, since_arg: str | None, until_arg: str | None) -> list[str]:
+    """
+    뒤에 부분만 붙이는 모드:
+    - since가 주어지면 그대로 사용
+    - 아니면 out_csv의 마지막 날짜+1일부터
+    - 그래도 없으면 DEFAULT_SINCE
+    - until이 없으면 어제
+    """
+    if until_arg and not re.fullmatch(r"\d{8}", until_arg):
+        raise ValueError("until은 YYYYMMDD 8자리여야 합니다.")
+    if since_arg and not re.fullmatch(r"\d{8}", since_arg):
+        raise ValueError("since는 YYYYMMDD 8자리여야 합니다.")
+
+    until = until_arg or _yesterday_yyyymmdd()
+
+    if since_arg:
+        since = since_arg
+    else:
+        last = _max_date_in_csv(out_csv)
+        if last:
+            since = _next_day(last)
+        else:
+            since = DEFAULT_SINCE
+
     s = datetime.strptime(since, "%Y%m%d").date()
     e = datetime.strptime(until, "%Y%m%d").date()
-    d = s
+    if s > e:
+        print(f"[INFO] 최신 CSV({out_csv})가 이미 {until}까지 포함 → 신규 수집 없음")
+        return []
     out = []
+    d = s
     while d <= e:
         out.append(d.strftime("%Y%m%d"))
         d += timedelta(days=1)
+    print(f"[INFO] append-mode 수집 범위: {since}..{until}")
     return out
 
-def upsert_csv(out_csv: str, new_rows: list[dict], since: str, until: str):
+# ---------------------- append writer ----------------------
+def append_csv(out_csv: str, new_rows: list[dict]):
     os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
     new_df = pd.DataFrame(new_rows)
+    # 스키마 정렬
+    cols = [
+        "date","stadium","away_team","home_team",
+        "away_score","home_score","away_result","home_result",
+        "away_hit","home_hit","away_hr","home_hr",
+        "away_ab","home_ab","away_avg","home_avg"
+    ]
+    for c in cols:
+        if c not in new_df.columns:
+            new_df[c] = pd.Series([None]*len(new_df))
+    new_df = new_df[cols]
+
     if os.path.exists(out_csv):
         old = pd.read_csv(out_csv, encoding="utf-8-sig")
-        # 동일 스키마 강제
-        cols = [
-            "date","stadium","away_team","home_team",
-            "away_score","home_score","away_result","home_result",
-            "away_hit","home_hit","away_hr","home_hr",
-            "away_ab","home_ab","away_avg","home_avg"
-        ]
         for c in cols:
             if c not in old.columns:
                 old[c] = pd.Series([None]*len(old))
         old = old[cols]
-        mask = (pd.to_datetime(old["date"]) >= pd.to_datetime(_yyyymmdd_to_iso(since))) & \
-               (pd.to_datetime(old["date"]) <= pd.to_datetime(_yyyymmdd_to_iso(until)))
-        kept = old.loc[~mask].copy()
-        out = pd.concat([kept, new_df], ignore_index=True)
+        # append 전, 혹시 겹치는 날짜가 있을 경우(수동으로 since를 뒤로 준 경우) 뒤쪽만 유지
+        if not old.empty:
+            max_old = pd.to_datetime(old["date"]).max()
+            if not pd.isna(max_old):
+                cutoff = max_old.strftime("%Y-%m-%d")
+                new_df = new_df[pd.to_datetime(new_df["date"]) > pd.to_datetime(cutoff)]
+        out = pd.concat([old, new_df], ignore_index=True)
     else:
         out = new_df
-    out = out.sort_values("date").reset_index(drop=True)
-    out.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"[INFO] upserted {len(new_df)} rows -> {out_csv}")
 
+    out = out.sort_values(["date","stadium","away_team","home_team"]).reset_index(drop=True)
+    out.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"[INFO] appended {len(new_df)} rows -> {out_csv}")
+
+# ---------------------- CLI main ----------------------
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--since", default=None)
-    ap.add_argument("--until", default=None)
+    ap.add_argument("--since", default=None, help="YYYYMMDD (생략 시 append-mode: 기존 CSV 마지막+1)")
+    ap.add_argument("--until", default=None, help="YYYYMMDD (생략 시 어제)")
     ap.add_argument("--out",   default="data/kbo_latest.csv")
-    ap.add_argument("--force", default="false")
+    ap.add_argument("--force", default="false", help="checkpoints 무시 여부(true/false)")
     args = ap.parse_args()
 
     force_refresh = str(args.force).lower() in ("1","true","yes")
 
-    rng = days(args.since, args.until)
-    print(f"[INFO] Running crawler for {rng[0]}..{rng[-1]} (force_refresh={force_refresh})")
+    rng = days_append_mode(args.out, args.since, args.until)
+    if not rng:
+        return
 
     crawler = UltraPreciseKBOCrawler(headless=True)
     try:
         df = crawler.crawl_kbo_games(rng, force_refresh=force_refresh)
         rows = df.to_dict("records")
         if rows:
-            upsert_csv(args.out, rows, rng[0], rng[-1])
+            append_csv(args.out, rows)
         else:
             print("[INFO] 신규 행 없음")
     finally:
@@ -444,4 +518,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
