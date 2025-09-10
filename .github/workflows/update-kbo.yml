@@ -2,7 +2,7 @@ name: Update KBO CSV
 
 on:
   schedule:
-    # 매일 23:30 KST (UTC 14:30)
+    # 예: 03:30 KST면 18:30 UTC
     - cron: "30 17 * * *"
   workflow_dispatch:
     inputs:
@@ -21,7 +21,7 @@ on:
 
 jobs:
   crawl:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest   # ← 필요시 ubuntu-22.04로 고정 가능
     env:
       TZ: Asia/Seoul
       OUT: data/kbo_latest.csv
@@ -42,9 +42,11 @@ jobs:
 
       - name: Install system libs (for Chrome)
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            libnss3 libgbm1 libasound2 libxshmfence1 libgtk-3-0 libx11-xcb1 fonts-liberation
+            libnss3 libgbm1 libxshmfence1 libgtk-3-0 libx11-xcb1 fonts-liberation
+          sudo apt-get install -y libasound2 || sudo apt-get install -y libasound2t64
 
       - name: Install Google Chrome
         id: chrome
@@ -89,3 +91,4 @@ jobs:
           else
             echo "Nothing to push."
           fi
+
