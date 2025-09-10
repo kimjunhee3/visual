@@ -1,13 +1,13 @@
 # KBO_crawl.py
 # -*- coding: utf-8 -*-
 
-import os, re, time
+import os, re, sys
+import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 from bs4 import BeautifulSoup
-import requests
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -15,29 +15,26 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # -------------------------------------------------
-# 설정값
+# 상수/환경
 # -------------------------------------------------
 DEFAULT_SINCE = "20250322"
-OUT_CSV = "data/kbo_latest.csv"
+DEFAULT_OUT = "data/kbo_latest.csv"
 
-# 최근 N일 동안 CSV에 '예정'이 남아있으면 해당 날짜 재수집
+# '예정' 재확인 범위(최근 N일)
 RECHECK_DAYS = int(os.getenv("RECHECK_DAYS", "7"))
-# CSV에 이미 들어있는 가장 최근 경기 K개를 무조건 재크롤하여 교체
+# CSV에 있는 최신 경기 K개 강제 재크롤(교체)
 RECENT_RECRAWL_GAMES = int(os.getenv("RECENT_RECRAWL_GAMES", "3"))
 
 SCHEDULE_DAY_URL = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameDate={d}"
 REVIEW_URL       = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameId={gid}&gameDate={gdt}&section=REVIEW"
 
-_UA_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/127.0 Safari/537.36"
-    )
-}
-
 # -------------------------------------------------
 # 유틸
 # -------------------------------------------------
+def _today_kst() -> datetime.date:
+    # 러너에서 TZ=Asia/Seoul로 설정되어 있으니 pandas로 확실히 맞춤
+    return pd.Timestamp.now(tz="Asia/Seoul").date()
+
 def _ymd(dt: datetime.date) -> str:
     return dt.strftime("%Y%m%d")
 
@@ -50,8 +47,7 @@ def _clean_stadium(s: str) -> str:
 
 def _strip_num(s: str) -> Optional[int]:
     s = (s or "").strip()
-    if s == "":
-        return None
+    if s == "": return None
     m = re.search(r"-?\d+", s.replace(",", ""))
     return int(m.group()) if m else None
 
@@ -67,7 +63,7 @@ def load_existing(csv_path: str) -> pd.DataFrame:
     return df
 
 def has_pending(row: pd.Series) -> bool:
-    # '예정' 텍스트, 점수 미기입, REVIEW 정보 부재 등을 포괄
+    """CSV 한 행이 '예정' 상태인지 판별"""
     def txt(k):
         v = row.get(k, "")
         return (str(v) if pd.notna(v) else "").strip()
@@ -75,16 +71,14 @@ def has_pending(row: pd.Series) -> bool:
     keys = [k for k in row.index if any(s in k.lower() for s in ["result", "결과", "상태"])]
     if any("예정" in txt(k) for k in keys):
         return True
-
     if txt("home_score") == "" and txt("away_score") == "":
         return True
-
     if txt("section") != "REVIEW" and txt("review_url") == "":
         return True
-
     return False
 
 def replace_by_gameid(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
+    """같은 gameId는 신규 데이터로 교체(덮어쓰기)"""
     if df_old is None or len(df_old) == 0:
         return df_new.copy()
 
@@ -92,6 +86,7 @@ def replace_by_gameid(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFram
         old = df_old[~df_old["gameId"].isin(set(df_new["gameId"].dropna()))]
         return pd.concat([old, df_new], ignore_index=True)
 
+    # 임시키(date|home|away) 폴백
     must = ["date","home","away"]
     if all(c in df_old.columns for c in must) and all(c in df_new.columns for c in must):
         old = df_old.copy(); new = df_new.copy()
@@ -104,38 +99,50 @@ def replace_by_gameid(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFram
     return pd.concat([df_old, df_new], ignore_index=True).drop_duplicates()
 
 # -------------------------------------------------
-# 대상 날짜 산정 (속도 최적화)
+# 대상 날짜 산정
 # -------------------------------------------------
-def build_target_dates(since_str: str, until_str: Optional[str], df_old: pd.DataFrame) -> List[str]:
-    """
-    기존: since~until 전체
-    변경: CSV가 존재하면 → (CSV 최신일 - RECHECK_DAYS) ~ 오늘 로 '좁혀서' 수행
-          + CSV 안의 '예정' 날짜는 무조건 포함
-    CSV가 없을 때만 환경변수 구간 전체 수행
-    """
-    today = datetime.now().date()
-    since_env = datetime.strptime(since_str, "%Y%m%d").date()
-    until = today if not until_str else datetime.strptime(until_str, "%Y%m%d").date()
+def decide_since_until(args_since: str, args_until: str, df_old: pd.DataFrame, force: bool) -> Tuple[str, str]:
+    """--since/--until 입력을 해석. 비었으면 'CSV 마지막+1 ~ 어제'"""
+    today = _today_kst()
+    until_date = pd.to_datetime(args_until, format="%Y%m%d", errors='coerce').date() if args_until else (today - timedelta(days=1))
+    if until_date > today:  # 어제 규칙 보정
+        until_date = today - timedelta(days=1)
 
-    if df_old is not None and len(df_old) and "date" in df_old.columns:
-        latest = pd.to_datetime(df_old["date"]).dt.date.max()
-        # 최소 버퍼 14일 확보
-        start = max(latest - timedelta(days=RECHECK_DAYS),
-                    today - timedelta(days=max(RECHECK_DAYS, 14)))
-        base = {_ymd(start + timedelta(days=i)) for i in range((until - start).days + 1)}
-        # '예정' 남아있는 날짜 추가
+    if args_since:
+        since_date = pd.to_datetime(args_since, format="%Y%m%d").date()
+    else:
+        if (df_old is not None) and len(df_old) and ("date" in df_old.columns) and not force:
+            last = pd.to_datetime(df_old["date"]).dt.date.max()
+            since_date = last + timedelta(days=1)
+            if since_date > until_date:
+                since_date = until_date  # 범위 empty 방지
+        else:
+            # 초기 수행 또는 강제 모드: until 하루만 기본
+            since_date = until_date
+
+    return _ymd(since_date), _ymd(until_date)
+
+def build_target_dates(since_str: str, until_str: str, df_old: pd.DataFrame) -> List[str]:
+    """
+    기본: since~until 범위
+    + 최근 RECHECK_DAYS 내 CSV에서 '예정'이 남아있는 날짜는 무조건 포함(재크롤)
+    """
+    since = datetime.strptime(since_str, "%Y%m%d").date()
+    until = datetime.strptime(until_str, "%Y%m%d").date()
+    base = {_ymd(since + timedelta(days=i)) for i in range((until - since).days + 1)}
+
+    if df_old is not None and len(df_old) and "date" in df_old.columns and RECHECK_DAYS > 0:
+        today = _today_kst()
         cutoff = today - timedelta(days=RECHECK_DAYS)
         recent = df_old[df_old["date"] >= cutoff]
-        pend_days = {_ymd(d) for d in recent[recent.apply(has_pending, axis=1)]["date"].unique()}
-        base |= pend_days
-    else:
-        # 초기 적재
-        base = {_ymd(since_env + timedelta(days=i)) for i in range((until - since_env).days + 1)}
+        if len(recent):
+            pend_days = {_ymd(d) for d in recent[recent.apply(has_pending, axis=1)]["date"].unique()}
+            base |= pend_days
 
     return sorted(base)
 
 # -------------------------------------------------
-# Selenium 드라이버 (빠른 로딩 전략)
+# Selenium 드라이버
 # -------------------------------------------------
 def make_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
@@ -143,13 +150,12 @@ def make_driver() -> webdriver.Chrome:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1400,1000")
-    options.page_load_strategy = "eager"  # DOMContentLoaded 후 바로 진행
-    driver = webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)  # chromedriver는 YAML에서 설치
     driver.set_page_load_timeout(40)
     return driver
 
 # -------------------------------------------------
-# 날짜별 gameId 수집 (원래 방식 + 빠른 경로 우선)
+# 일정/리뷰 파싱 (원래 방식 유지)
 # -------------------------------------------------
 def extract_game_ids_from_schedule_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -172,36 +178,17 @@ def extract_game_ids_from_schedule_html(html: str) -> List[str]:
 
     return sorted(gids)
 
-def get_game_ids_for_date_fast(d: str) -> List[str]:
-    """Selenium 없이 requests로 빠르게"""
-    url = SCHEDULE_DAY_URL.format(d=d)
-    r = requests.get(url, headers=_UA_HEADERS, timeout=12)
-    r.raise_for_status()
-    return extract_game_ids_from_schedule_html(r.text)
-
 def get_game_ids_for_date(driver: webdriver.Chrome, d: str) -> List[str]:
-    # 1) 빠른 경로: requests
-    try:
-        gids = get_game_ids_for_date_fast(d)
-        if gids:
-            return gids
-    except Exception:
-        pass  # 실패 시 Selenium 백업
-
-    # 2) 백업: Selenium (원래 흐름)
     url = SCHEDULE_DAY_URL.format(d=d)
     driver.get(url)
     try:
-        WebDriverWait(driver, 4).until(
+        WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "table"))
         )
     except Exception:
         pass
     return extract_game_ids_from_schedule_html(driver.page_source)
 
-# -------------------------------------------------
-# 리뷰 페이지 파싱
-# -------------------------------------------------
 def _sum_hitter_table(table: Optional[BeautifulSoup]) -> Dict[str, Optional[int]]:
     if table is None:
         return {"hits": None, "home_runs": None}
@@ -387,17 +374,34 @@ def recrawl_recent_games(driver: webdriver.Chrome, df_old: pd.DataFrame, k: int)
     return pd.DataFrame(rows)
 
 # -------------------------------------------------
+# CLI
+# -------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="KBO 리뷰 크롤러")
+    p.add_argument("--since", type=str, default="", help="YYYYMMDD 시작일(비우면 CSV 마지막+1)")
+    p.add_argument("--until", type=str, default="", help="YYYYMMDD 종료일(비우면 어제)")
+    p.add_argument("--out",   type=str, default=DEFAULT_OUT, help="출력 CSV 경로")
+    p.add_argument("--force", type=str, default="false", help="체크포인트 무시 재수집(true/false)")
+    return p.parse_args()
+
+# -------------------------------------------------
 # 메인
 # -------------------------------------------------
-def main(since: Optional[str] = None, until: Optional[str] = None, out_csv: str = OUT_CSV):
-    since = since or os.getenv("SINCE", DEFAULT_SINCE)
-    until = until or os.getenv("UNTIL", None)
+def main():
+    args = parse_args()
+    out_csv = args.out
+    force = str(args.force).lower() in ("1","true","yes","y")
 
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
 
     df_old = load_existing(out_csv)
-    targets = build_target_dates(since, until, df_old)
+    since_str, until_str = decide_since_until(args.since, args.until, df_old, force)
+    print(f"[INFO] 대상 범위: {since_str} ~ {until_str} (force={force})")
 
+    targets = build_target_dates(since_str, until_str, df_old)
+    if not targets:
+        print("[INFO] 수집 대상 날짜가 없습니다.")
+        # 그래도 최신 K경기 강제 재크롤은 수행
     driver = make_driver()
     all_new = []
     try:
@@ -408,7 +412,7 @@ def main(since: Optional[str] = None, until: Optional[str] = None, out_csv: str 
             if df_d is not None and not df_d.empty:
                 all_new.append(df_d)
 
-        # 2) CSV 최신 K경기 강제 재크롤 → 교체용
+        # 2) 최신 K경기 강제 재크롤 → 교체용
         if df_old is not None and len(df_old) and RECENT_RECRAWL_GAMES > 0:
             print(f"[INFO] 최신 {RECENT_RECRAWL_GAMES}경기 강제 재크롤링...")
             df_recent = recrawl_recent_games(driver, df_old, RECENT_RECRAWL_GAMES)
@@ -439,8 +443,4 @@ def main(since: Optional[str] = None, until: Optional[str] = None, out_csv: str 
     print(f"[INFO] 저장 완료 → {out_csv} (rows={len(df_out)})")
 
 if __name__ == "__main__":
-    main(
-        since=os.environ.get("SINCE"),
-        until=os.environ.get("UNTIL"),
-        out_csv=os.environ.get("OUT", OUT_CSV),
-    )
+    main()
