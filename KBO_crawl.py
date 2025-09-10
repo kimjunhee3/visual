@@ -1,540 +1,527 @@
 # KBO_crawl.py
-import os, re, time, json, shutil, tempfile
+# -*- coding: utf-8 -*-
+"""
+KBO 리뷰 크롤러 (append-mode aware + pending refresh)
+
+핵심 기능
+- 날짜 범위 수집 + 기존 CSV에서 '예정'이 남아있는 최근 N일(RECHECK_DAYS)을 재수집
+- 같은 gameId는 새 수집분으로 교체(덮어쓰기)
+- 리뷰 페이지에서 구장/팀/점수/승패/안타/홈런 추출
+- '구장:' 접두어 제거하여 이름만 저장
+- REVIEW가 없거나 점수가 비어 있으면 해당 경기 상태를 '예정'으로 간주
+
+환경변수
+- SINCE: 기본 수집 시작일(YYYYMMDD). 기본값 DEFAULT_SINCE
+- UNTIL: 수집 종료일(YYYYMMDD). 기본값: 오늘
+- OUT: 출력 CSV 경로. 기본값 data/kbo_latest.csv
+- RECHECK_DAYS: 최근 N일 재검사(기본 7)
+
+의존성
+- selenium>=4.21, beautifulsoup4, pandas
+(셀레니움 4.10+는 Selenium Manager로 드라이버/브라우저 자동 관리)
+"""
+
+import os
+import re
+import time
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 
 import pandas as pd
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
-from selenium.common.exceptions import SessionNotCreatedException, TimeoutException
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+# -----------------------------
+# 설정
+# -----------------------------
 DEFAULT_SINCE = "20250322"
+OUT_CSV = "data/kbo_latest.csv"
+RECHECK_DAYS = int(os.getenv("RECHECK_DAYS", "7"))
 
 SCHEDULE_DAY_URL = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameDate={d}"
 REVIEW_URL       = "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?gameId={gid}&gameDate={gdt}&section=REVIEW"
 
-# ---------------------- util ----------------------
-def _norm(s: str | None) -> str:
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", s.replace("\xa0", " ")).strip()
+# -----------------------------
+# 유틸
+# -----------------------------
+def _ymd(dt: datetime.date) -> str:
+    return dt.strftime("%Y%m%d")
 
-def _yyyymmdd_to_iso(yyyymmdd: str) -> str:
-    return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
-
-def _iso_to_yyyymmdd(iso: str) -> str:
-    return iso.replace("-", "")
-
-def _to_int(s: str) -> int:
-    m = re.search(r"\d+", s or "")
-    return int(m.group()) if m else 0
-
-def _retry(n: int, delay: float, fn, *args, **kwargs):
-    last = None
-    for _ in range(n):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            last = e
-            time.sleep(delay)
-    raise last if last else RuntimeError("retry failed")
-
-def _clean_stadium_name(s: str) -> str:
-    """
-    '구장:', '장소:', '경기장:' 같은 접두어/콜론 제거 +
-    끝의 괄호 부가정보 제거 → 깔끔한 구장명만 남김
-    """
-    t = _norm(s)
-    if not t:
-        return ""
-    t = re.sub(r"^(구장|장소|경기장)\s*[:：]\s*", "", t)
-    t = re.sub(r"\s*\([^()]*\)\s*$", "", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t
-
-# ---------------------- crawler ----------------------
-class UltraPreciseKBOCrawler:
-    def __init__(self, headless: bool = True):
-        self.driver = None
-        self._tmp_profile = None
-        self._setup_driver(headless=headless)
-
-    def _setup_driver(self, headless: bool):
-        opts = Options()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        self._tmp_profile = tempfile.mkdtemp(prefix="chrome-profile-")
-        opts.add_argument(f"--user-data-dir={self._tmp_profile}")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-
-        try:
-            self.driver = webdriver.Chrome(options=opts)
-            self.driver.set_page_load_timeout(60)
-            print("ChromeDriver 시작 성공")
-        except SessionNotCreatedException as e:
-            print(f"[FATAL] Chrome 세션 생성 실패: {e}")
-            raise
-        except Exception as e:
-            print(f"[FATAL] Chrome 시작 실패: {e}")
-            raise
-
-    # --------------- public API ---------------
-    def crawl_kbo_games(self, date_list, checkpoint_dir="checkpoints", force_refresh=False) -> pd.DataFrame:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        results = []
-
-        for d in date_list:
-            print(f"[DAY] {d} 수집 시도…")
-            ck = os.path.join(checkpoint_dir, f"{d}.csv")
-            if (not force_refresh) and os.path.exists(ck):
-                print(f"  └ checkpoint 존재 → 건너뜀")
-                try:
-                    results.extend(pd.read_csv(ck).to_dict("records"))
-                except Exception as e:
-                    print("  └ checkpoint 읽기 실패:", e)
-                continue
-
-            try:
-                self.driver.get(SCHEDULE_DAY_URL.format(d=d))
-                _retry(3, 1.0, self._wait_list_loaded)
-
-                soup = BeautifulSoup(self.driver.page_source, "html.parser")
-                games = soup.select("li.game-cont")
-                if not games:
-                    print(f"  └ {d}: 경기 없음 → 스킵")
-                    continue
-
-                day_rows = []
-                for li in games:
-                    gi = self._extract_one_game_from_list(li, d)
-                    if not gi:
-                        continue
-
-                    # 종료 경기만 리뷰 파싱(리뷰 버튼이 보이면 종료로 간주)
-                    if gi["away_result"] in ("승", "패", "무") and gi.get("game_id"):
-                        detail = _retry(3, 1.0, self._fetch_review_detail,
-                                        gi["game_id"], gi["raw_date"], gi["away_team"], gi["home_team"])
-                        # 목록에서 못 구한 구장명은 리뷰에서 보강
-                        if (not gi.get("stadium")) and detail.get("stadium_review"):
-                            gi["stadium"] = detail["stadium_review"]
-                        gi.update(detail)
-
-                    day_rows.append(gi)
-
-                if day_rows:
-                    pd.DataFrame(day_rows).to_csv(ck, index=False, encoding="utf-8-sig")
-                    results.extend(day_rows)
-                    print(f"  └ 저장 완료: {len(day_rows)}경기")
-                else:
-                    print(f"  └ {d}: 종료 경기 없음")
-            except Exception as e:
-                print(f"[WARN] {d} 처리 실패:", e)
-                continue
-
-            time.sleep(1.2)
-
-        return pd.DataFrame(results)
-
-    def _wait_list_loaded(self):
-        try:
-            WebDriverWait(self.driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "li.game-cont"))
-            )
-        except TimeoutException:
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "li.game-cont"))
-            )
-        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.5)
-
-    def cleanup(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-        if self._tmp_profile and os.path.isdir(self._tmp_profile):
-            shutil.rmtree(self._tmp_profile, ignore_errors=True)
-
-    # --------------- list page helpers ---------------
-    def _extract_one_game_from_list(self, li, url_date_yyyymmdd: str) -> dict | None:
-        try:
-            # gameId / gameDate 우선 확보
-            game_id  = li.get("g_id") or li.get("gid") or ""
-            game_date = li.get("g_dt") or url_date_yyyymmdd
-
-            # 리뷰 링크가 있으면 href에서 보정
-            a_review = li.select_one("a#btnReview, a[href*='section=REVIEW']")
-            if a_review and a_review.has_attr("href"):
-                href = a_review["href"]
-                gid  = re.search(r"gameId=([0-9A-Z]+)", href)
-                gdt  = re.search(r"gameDate=(\d{8})", href)
-                if gid: game_id = gid.group(1)
-                if gdt: game_date = gdt.group(1)
-
-            date_iso = _yyyymmdd_to_iso(game_date)
-
-            # 점수
-            def _score(sel):
-                el = li.select_one(sel)
-                t  = _norm(el.get_text()) if el else ""
-                return int(t) if t.isdigit() else 0
-            away_score = _score(".team.away .score")
-            home_score = _score(".team.home .score")
-
-            # 종료 판정: class end 또는 리뷰 버튼 유무
-            end_flag = ("end" in (li.get("class") or [])) or (a_review is not None)
-
-            away_nm_el = li.select_one(".team.away .name")
-            home_nm_el = li.select_one(".team.home .name")
-            away_name = li.get("away_nm") or (_norm(away_nm_el.get_text()) if away_nm_el else "")
-            home_name = li.get("home_nm") or (_norm(home_nm_el.get_text()) if home_nm_el else "")
-
-            def result_for(is_away: bool) -> str:
-                if not end_flag:
-                    return "예정"
-                if away_score == home_score:
-                    return "무"
-                if is_away:
-                    return "승" if away_score > home_score else "패"
-                else:
-                    return "승" if home_score > away_score else "패"
-
-            # 구장명: 속성/여러 후보 셀렉터 순차 시도
-            stadium = ""
-            for attr in ("stadium", "place", "data-stadium", "data-place"):
-                v = li.get(attr)
-                if v:
-                    stadium = _norm(v); break
-            if not stadium:
-                for sel in [".place", ".info .place", ".stadium", ".ballpark", "span.place", "p.place"]:
-                    el = li.select_one(sel)
-                    if el:
-                        stadium = _norm(el.get_text()); break
-
-            # 이름만 남기기
-            stadium = _clean_stadium_name(stadium)
-
-            return {
-                "raw_date": game_date,
-                "date": date_iso,
-                "stadium": stadium,
-                "away_team": away_name,
-                "home_team": home_name,
-                "away_score": away_score,
-                "home_score": home_score,
-                "away_result": result_for(True),
-                "home_result": result_for(False),
-                "game_id": game_id,
-            }
-        except Exception as e:
-            print("  └ list 파싱 실패:", e)
-            return None
-
-    # --------------- review page helpers ---------------
-    def _ensure_review_tab(self) -> bool:
-        try:
-            on = self.driver.find_elements(By.XPATH, "//li[@section='REVIEW' and contains(@class,'on')]")
-            if on:
-                return True
-            tab = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//li[@section='REVIEW']//a"))
-            )
-            tab.click()
-            time.sleep(1.0)
-            return True
-        except Exception:
-            return False
-
-    def _fetch_review_detail(self, game_id: str, gdt_yyyymmdd: str, away_team: str, home_team: str) -> dict:
-        try:
-            self.driver.get(REVIEW_URL.format(gid=game_id, gdt=gdt_yyyymmdd))
-            WebDriverWait(self.driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#tblScoreboard3, #tblAwayHitter3"))
-            )
-            self._ensure_review_tab()
-            time.sleep(0.8)
-            soup = BeautifulSoup(self.driver.page_source, "html.parser")
-
-            # 구장명 fallback
-            stadium_review = ""
-            for sel in ["#txtStadium", "#txtStadium1", "#txtStadium2",
-                        ".st_name", ".stadium", ".ballpark", ".park"]:
-                el = soup.select_one(sel)
-                if el:
-                    stadium_review = _norm(el.get_text()); break
-
-            stadium_review = _clean_stadium_name(stadium_review)
-
-            away_hit, home_hit = self._extract_hits(soup)
-            away_hr,  home_hr  = self._extract_hrs_with_fallback(soup)
-            away_ab,  home_ab  = self._extract_ab_with_fallback(soup)
-
-            away_avg = round(away_hit / away_ab, 4) if away_ab else 0.0
-            home_avg = round(home_hit / home_ab, 4) if home_ab else 0.0
-
-            return {
-                "stadium_review": stadium_review,
-                "away_hit": away_hit, "home_hit": home_hit,
-                "away_hr": away_hr,   "home_hr": home_hr,
-                "away_ab": away_ab,   "home_ab": home_ab,
-                "away_avg": away_avg, "home_avg": home_avg,
-            }
-        except Exception as e:
-            print("  └ 리뷰 상세 파싱 실패:", e)
-            return {
-                "stadium_review": "",
-                "away_hit": 0, "home_hit": 0,
-                "away_hr": 0, "home_hr": 0,
-                "away_ab": 0, "home_ab": 0,
-                "away_avg": 0.0, "home_avg": 0.0
-            }
-
-    # ----- H, HR, AB 추출 -----
-    def _extract_hits(self, soup: BeautifulSoup) -> tuple[int, int]:
-        away_hit = home_hit = 0
-        sb3 = soup.select_one("#tblScoreboard3")
-        if sb3:
-            heads = [_norm(th.get_text()) for th in sb3.select("thead th")]
-            if "H" in heads:
-                h_idx = heads.index("H")
-                rows = sb3.select("tbody tr")
-                if len(rows) >= 2:
-                    a_cells = rows[0].find_all("td")
-                    h_cells = rows[1].find_all("td")
-                    if len(a_cells) > h_idx: away_hit = _to_int(a_cells[h_idx].get_text())
-                    if len(h_cells) > h_idx: home_hit = _to_int(h_cells[h_idx].get_text())
-        if away_hit == 0 and home_hit == 0:
-            a = soup.select_one("#tblAwayHitter3 tfoot tr")
-            h = soup.select_one("#tblHomeHitter3 tfoot tr")
-            if a:
-                tds = a.find_all("td")
-                if len(tds) >= 2: away_hit = _to_int(tds[1].get_text())
-            if h:
-                tds = h.find_all("td")
-                if len(tds) >= 2: home_hit = _to_int(tds[1].get_text())
-        return away_hit, home_hit
-
-    def _count_hr_in_hitter2(self, soup: BeautifulSoup, home: bool) -> int:
-        table_id = "#tblHomeHitter2" if home else "#tblAwayHitter2"
-        tbody = soup.select_one(f"{table_id} tbody")
-        if not tbody:
-            return -1
-        cnt = 0
-        for tr in tbody.select("tr"):
-            for td in tr.find_all("td"):
-                t = _norm(td.get_text())
-                if not t:
-                    continue
-                if "홈" in t and "홈인" not in t:
-                    n = _to_int(t)
-                    cnt += n if n > 0 else 1
-        return cnt
-
-    def _extract_hrs_with_fallback(self, soup: BeautifulSoup) -> tuple[int, int]:
-        home_hr = self._count_hr_in_hitter2(soup, home=True)
-        away_hr = self._count_hr_in_hitter2(soup, home=False)
-        if home_hr >= 0 and away_hr >= 0:
-            return away_hr, home_hr
-
-        away_pitchers = {_norm(tds[0].get_text())
-                         for tr in soup.select("#tblAwayPitcher tbody tr")
-                         if (tds := tr.find_all("td"))}
-        home_pitchers = {_norm(tds[0].get_text())
-                         for tr in soup.select("#tblHomePitcher tbody tr")
-                         if (tds := tr.find_all("td"))}
-
-        a_hr = h_hr = 0
-        etc = soup.select_one("#tblEtc")
-        if etc:
-            for tr in etc.select("tr"):
-                th = tr.find("th"); td = tr.find("td")
-                if not th or not td or "홈런" not in _norm(th.get_text()):
-                    continue
-                text = _norm(td.get_text())
-                for p in re.findall(r"\([^)]* ([가-힣A-Za-z0-9]+)\)", text):
-                    if p in away_pitchers:
-                        h_hr += 1
-                    elif p in home_pitchers:
-                        a_hr += 1
-        if away_hr < 0: away_hr = a_hr
-        if home_hr < 0: home_hr = h_hr
-        return away_hr, home_hr
-
-    def _extract_ab_with_fallback(self, soup: BeautifulSoup) -> tuple[int, int]:
-        def from_hitter3(home: bool) -> int:
-            t = soup.select_one("#tblHomeHitter3 tfoot tr" if home else "#tblAwayHitter3 tfoot tr")
-            if not t: return -1
-            tds = t.find_all("td")
-            return _to_int(tds[0].get_text()) if tds else -1
-
-        home_ab = from_hitter3(True)
-        away_ab = from_hitter3(False)
-        if home_ab >= 0 and away_ab >= 0:
-            return away_ab, home_ab
-
-        EXCLUDE = ("4구", "볼넷", "사구", "고의4구", "고의사구", "희비", "희플", "희번트", "희타")
-        HIT_PAT = re.compile(r"(안타|좌안|중안|우안)")
-        OUT_PAT = re.compile(r"(땅|뜬|삼진|파|직|수비|병살)")
-
-        def estimate_from_hitter2(home: bool) -> int:
-            table_id = "#tblHomeHitter2" if home else "#tblAwayHitter2"
-            tbody = soup.select_one(f"{table_id} tbody")
-            if not tbody:
-                return 0
-            ab = 0
-            for tr in tbody.select("tr"):
-                for td in tr.find_all("td"):
-                    t = _norm(td.get_text())
-                    if not t: continue
-                    if any(x in t for x in EXCLUDE):
-                        continue
-                    if "홈" in t and "홈인" not in t:
-                        ab += 1; continue
-                    if HIT_PAT.search(t) or OUT_PAT.search(t):
-                        ab += 1
-            return ab
-
-        if away_ab < 0: away_ab = estimate_from_hitter2(False)
-        if home_ab < 0: home_ab = estimate_from_hitter2(True)
-        return away_ab, home_ab
-
-# ---------------------- date helpers ----------------------
-def _yesterday_yyyymmdd() -> str:
-    return (datetime.today() - timedelta(days=1)).strftime("%Y%m%d")
-
-def _next_day(yyyymmdd: str) -> str:
-    d = datetime.strptime(yyyymmdd, "%Y%m%d").date() + timedelta(days=1)
-    return d.strftime("%Y%m%d")
-
-def _max_date_in_csv(out_csv: str) -> str | None:
-    if not os.path.exists(out_csv):
-        return None
+def _to_date(s) -> Optional[datetime.date]:
     try:
-        df = pd.read_csv(out_csv, encoding="utf-8-sig")
-        if "date" not in df.columns or df.empty:
-            return None
-        mx = pd.to_datetime(df["date"]).max()
-        if pd.isna(mx):
-            return None
-        return mx.strftime("%Y%m%d")
+        return pd.to_datetime(s).date()
     except Exception:
         return None
 
-def days_append_mode(out_csv: str, since_arg: str | None, until_arg: str | None) -> list[str]:
-    """
-    뒤에 부분만 붙이는 모드:
-    - since가 주어지면 그대로 사용
-    - 아니면 out_csv의 마지막 날짜+1일부터
-    - 그래도 없으면 DEFAULT_SINCE
-    - until이 없으면 어제
-    """
-    if until_arg and not re.fullmatch(r"\d{8}", until_arg):
-        raise ValueError("until은 YYYYMMDD 8자리여야 합니다.")
-    if since_arg and not re.fullmatch(r"\d{8}", since_arg):
-        raise ValueError("since는 YYYYMMDD 8자리여야 합니다.")
+def _text(el) -> str:
+    if el is None:
+        return ""
+    return el.get_text(" ", strip=True)
 
-    until = until_arg or _yesterday_yyyymmdd()
+def _clean_stadium(s: str) -> str:
+    # "구장: 잠실" -> "잠실"
+    s = re.sub(r"^구장\s*:\s*", "", s.strip())
+    return s
 
-    if since_arg:
-        since = since_arg
+def _strip_num(s: str) -> Optional[int]:
+    s = (s or "").strip()
+    if s == "": 
+        return None
+    m = re.search(r"-?\d+", s.replace(",", ""))
+    return int(m.group()) if m else None
+
+# -----------------------------
+# CSV 로드/저장 보조
+# -----------------------------
+def load_existing(csv_path: str) -> pd.DataFrame:
+    if not os.path.exists(csv_path):
+        return pd.DataFrame()
+    df = pd.read_csv(csv_path)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
+
+def has_pending(row: pd.Series) -> bool:
+    """
+    '예정'으로 판단하는 조건:
+    - 결과 칼럼(결과/result/상태) 중 하나라도 '예정'
+    - 또는 점수 공란
+    - 또는 REVIEW 섹션/URL 부재
+    """
+    def txt(k):
+        v = row.get(k, "")
+        return (str(v) if pd.notna(v) else "").strip()
+
+    # 결과 텍스트 기반
+    keys = [k for k in row.index if any(s in k.lower() for s in ["result", "결과", "상태"])]
+    if any("예정" in txt(k) for k in keys):
+        return True
+
+    # 점수 공란
+    hs, as_ = txt("home_score"), txt("away_score")
+    if hs == "" and as_ == "":
+        return True
+
+    # 리뷰 플래그/URL
+    if txt("section") != "REVIEW" and txt("review_url") == "":
+        return True
+
+    return False
+
+def replace_by_gameid(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
+    """
+    같은 gameId는 신규로 교체(덮어쓰기).
+    gameId가 없다면 (date,home,away)를 임시키로 사용.
+    """
+    if df_old is None or len(df_old) == 0:
+        return df_new.copy()
+
+    if "gameId" in df_new.columns and "gameId" in df_old.columns:
+        old = df_old[~df_old["gameId"].isin(set(df_new["gameId"].dropna()))]
+        out = pd.concat([old, df_new], ignore_index=True)
+        return out
+
+    # 임시키 (date|home|away)
+    must = ["date", "home", "away"]
+    if all(c in df_old.columns for c in must) and all(c in df_new.columns for c in must):
+        old = df_old.copy()
+        new = df_new.copy()
+        old["_k"] = pd.to_datetime(old["date"]).dt.strftime("%Y%m%d") + "|" + old["home"].astype(str) + "|" + old["away"].astype(str)
+        new["_k"] = pd.to_datetime(new["date"]).dt.strftime("%Y%m%d") + "|" + new["home"].astype(str) + "|" + new["away"].astype(str)
+        old = old[~old["_k"].isin(set(new["_k"]))]
+        out = pd.concat([old.drop(columns=["_k"], errors="ignore"), new.drop(columns=["_k"], errors="ignore")], ignore_index=True)
+        return out
+
+    # 마지막 수단
+    return pd.concat([df_old, df_new], ignore_index=True).drop_duplicates()
+
+def build_target_dates(since_str: str, until_str: Optional[str], df_old: pd.DataFrame) -> List[str]:
+    today = datetime.now().date()
+    since = datetime.strptime(since_str, "%Y%m%d").date()
+    until = today if not until_str else datetime.strptime(until_str, "%Y%m%d").date()
+
+    base = {_ymd(since + timedelta(days=i)) for i in range((until - since).days + 1)}
+
+    # 최근 N일 중 CSV에 '예정'이 남아있으면 재수집
+    if df_old is not None and len(df_old) and "date" in df_old.columns:
+        cutoff = today - timedelta(days=RECHECK_DAYS)
+        recent = df_old[df_old["date"] >= cutoff]
+        if len(recent):
+            pend_days = {_ymd(d) for d in recent[recent.apply(has_pending, axis=1)]["date"].unique()}
+            base |= pend_days
+
+    return sorted(base)
+
+# -----------------------------
+# Selenium 드라이버
+# -----------------------------
+def make_driver() -> webdriver.Chrome:
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1400,1000")
+    driver = webdriver.Chrome(options=options)  # Selenium Manager가 브라우저/드라이버 관리
+    driver.set_page_load_timeout(60)
+    return driver
+
+# -----------------------------
+# 날짜별 gameId 수집
+# -----------------------------
+def extract_game_ids_from_schedule_html(html: str) -> List[str]:
+    """
+    일정 페이지의 '리뷰' 버튼/링크에서 gameId를 뽑아낸다.
+    - onclick 또는 href 파라미터로 노출되는 케이스를 모두 처리
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    gids = set()
+
+    # 1) id가 btnReview* 이거나 텍스트가 '리뷰' 인 버튼/링크
+    for tag in soup.select('a, button'):
+        text = _text(tag)
+        id_attr = (tag.get("id") or "").lower()
+        cls = " ".join(tag.get("class") or []).lower()
+        if "리뷰" in text or "btnreview" in id_attr or "btnreview" in cls:
+            # href / onclick에서 gameId 추출
+            for attr in ["href", "onclick", "data-href", "data-url"]:
+                v = tag.get(attr)
+                if not v:
+                    continue
+                m = re.search(r"gameId=([0-9A-Za-z\-]+)", v)
+                if m:
+                    gids.add(m.group(1))
+
+    # 2) 백업: URL 텍스트 자체에 gameId가 있는 경우
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"gameId=([0-9A-Za-z\-]+)", a["href"])
+        if m:
+            gids.add(m.group(1))
+
+    return sorted(gids)
+
+def get_game_ids_for_date(driver: webdriver.Chrome, d: str) -> List[str]:
+    url = SCHEDULE_DAY_URL.format(d=d)
+    driver.get(url)
+    # 테이블 로드 대기(없어도 2~3초는 기다린다)
+    try:
+        WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table"))
+        )
+    except Exception:
+        pass
+    html = driver.page_source
+    gids = extract_game_ids_from_schedule_html(html)
+    return gids
+
+# -----------------------------
+# 리뷰 페이지 파싱
+# -----------------------------
+def _sum_hitter_table(table: Optional[BeautifulSoup]) -> Dict[str, Optional[int]]:
+    """
+    홈/원정 타자 테이블에서 '안타', '홈런' 합계를 계산한다.
+    컬럼명이 약간씩 달라질 수 있으므로 헤더 텍스트 기반으로 인덱스를 찾는다.
+    """
+    if table is None:
+        return {"hits": None, "home_runs": None}
+
+    thead = table.find("thead")
+    tbody = table.find("tbody")
+    if not thead or not tbody:
+        return {"hits": None, "home_runs": None}
+
+    headers = [h.get_text(strip=True) for h in thead.select("th, td")]
+    # 안타/홈런 컬럼 위치 탐색
+    hit_idx = None
+    hr_idx = None
+    for i, h in enumerate(headers):
+        if any(k in h for k in ["안타", "H", "Hit", "Hits"]):
+            if hit_idx is None:
+                hit_idx = i
+        if any(k in h for k in ["홈런", "HR", "HomeRun"]):
+            if hr_idx is None:
+                hr_idx = i
+
+    total_hits = 0
+    total_hr = 0
+    rows = tbody.find_all("tr")
+    found_row = False
+    for r in rows:
+        tds = r.find_all(["td", "th"])
+        if not tds:
+            continue
+        found_row = True
+        if hit_idx is not None and hit_idx < len(tds):
+            v = _strip_num(tds[hit_idx].get_text())
+            if v is not None:
+                total_hits += v
+        if hr_idx is not None and hr_idx < len(tds):
+            v = _strip_num(tds[hr_idx].get_text())
+            if v is not None:
+                total_hr += v
+
+    if not found_row:
+        return {"hits": None, "home_runs": None}
+
+    return {"hits": total_hits, "home_runs": total_hr}
+
+def parse_review_page_html(html: str) -> Dict[str, Optional[str]]:
+    """
+    리뷰 페이지에서 필요한 필드 추출.
+    우선순위 셀렉터:
+      - 구장명: #txtStadium (텍스트에서 "구장:" 제거)
+      - 승패/팀: #tblScoreboard1
+      - 점수:   #tblScoreboard3
+      - 타자합: #tblHomeHitter2, #tblAwayHitter2
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 구장
+    stadium = None
+    s_el = soup.select_one("#txtStadium")
+    if s_el:
+        stadium = _clean_stadium(_text(s_el))
+    if not stadium:
+        # 백업: 텍스트 어딘가 "구장:" 패턴
+        m = soup.find(string=re.compile(r"구장\s*:"))
+        if m:
+            stadium = _clean_stadium(str(m))
+
+    # 점수 (tblScoreboard3: 보통 홈/원정 점수 표)
+    home_score = away_score = None
+    sc_tb = soup.select_one("#tblScoreboard3")
+    if sc_tb:
+        # 관례상 thead에 열 제목, tbody 첫 행에 점수
+        try:
+            body = sc_tb.find("tbody")
+            if not body:
+                body = sc_tb
+            rows = body.find_all("tr")
+            # 점수 두 칸을 찾는다(숫자 가장 많은 두 칸)
+            nums = []
+            for r in rows:
+                for c in r.find_all(["td", "th"]):
+                    v = _strip_num(c.get_text())
+                    if v is not None:
+                        nums.append(v)
+            if len(nums) >= 2:
+                # 표 구조가 일정하지 않으므로, 첫 2개를 away, home로 가정하지 않고
+                # 아래에서 팀명 매핑 후 재정렬
+                # 일단 최대/두번째 같은 방식 쓰지 말고 keep
+                pass
+        except Exception:
+            pass
+
+    # 승패/팀 (tblScoreboard1): 팀명/승패가 같이 있는 표
+    home_team = away_team = None
+    home_result = away_result = None
+    sb_tb = soup.select_one("#tblScoreboard1")
+    if sb_tb:
+        try:
+            body = sb_tb.find("tbody") or sb_tb
+            rows = body.find_all("tr")
+            # 보통 2행(홈/원정 또는 반대). 텍스트에서 '승','패','무','예정' 감지
+            # 첫 행을 보통 원정, 두 번째를 홈으로 보는 경우 많지만 안전하게 W/L 텍스트와 점수 표 순서로 다시 매칭
+            team_rows = []
+            for r in rows:
+                cols = [c.get_text(strip=True) for c in r.find_all(["td","th"])]
+                if not cols:
+                    continue
+                txt = " ".join(cols)
+                # 팀명: 한글/영문 혼합 허용
+                m_team = re.findall(r"[A-Za-z가-힣]+", txt)
+                team = None
+                if m_team:
+                    team = m_team[0]  # 가장 앞에 오는 토큰을 팀명으로
+                res = None
+                if "승" in txt: res = "승"
+                elif "패" in txt: res = "패"
+                elif "무" in txt: res = "무"
+                elif "예정" in txt: res = "예정"
+                team_rows.append((team, res, txt))
+            if len(team_rows) >= 2:
+                # 관례적으로 [away, home] 순서를 가정
+                away_team, away_result, _ = team_rows[0]
+                home_team, home_result, _ = team_rows[1]
+        except Exception:
+            pass
+
+    # 점수 재획득(팀 순서를 알았으니 다시 시도)
+    if sc_tb and (home_score is None or away_score is None):
+        try:
+            # 많은 페이지에서 score 표는 좌=원정, 우=홈
+            body = sc_tb.find("tbody") or sc_tb
+            rows = body.find_all("tr")
+            # 숫자 셀들을 왼→오 순서대로 모아서 2개만 뽑는다
+            num_cells = []
+            for r in rows:
+                for c in r.find_all(["td","th"]):
+                    v = _strip_num(c.get_text())
+                    if v is not None:
+                        num_cells.append(v)
+            if len(num_cells) >= 2:
+                away_score = num_cells[0]
+                home_score = num_cells[1]
+        except Exception:
+            pass
+
+    # 타자 표 합계
+    home_hits = home_hr = away_hits = away_hr = None
+    home_hit_tb = soup.select_one("#tblHomeHitter2")
+    away_hit_tb = soup.select_one("#tblAwayHitter2")
+    if home_hit_tb:
+        s = _sum_hitter_table(home_hit_tb)
+        home_hits, home_hr = s["hits"], s["home_runs"]
+    if away_hit_tb:
+        s = _sum_hitter_table(away_hit_tb)
+        away_hits, away_hr = s["hits"], s["home_runs"]
+
+    # 상태 결정
+    status = None
+    if any(x in ["예정", None, ""] for x in [home_result, away_result]) or (home_score is None and away_score is None):
+        status = "예정"
     else:
-        last = _max_date_in_csv(out_csv)
-        if last:
-            since = _next_day(last)
-        else:
-            since = DEFAULT_SINCE
+        status = "종료"
 
-    s = datetime.strptime(since, "%Y%m%d").date()
-    e = datetime.strptime(until, "%Y%m%d").date()
-    if s > e:
-        print(f"[INFO] 최신 CSV({out_csv})가 이미 {until}까지 포함 → 신규 수집 없음")
-        return []
-    out = []
-    d = s
-    while d <= e:
-        out.append(d.strftime("%Y%m%d"))
-        d += timedelta(days=1)
-    print(f"[INFO] append-mode 수집 범위: {since}..{until}")
-    return out
+    return {
+        "stadium": stadium,
+        "home": home_team,
+        "away": away_team,
+        "home_score": home_score,
+        "away_score": away_score,
+        "home_result": home_result,
+        "away_result": away_result,
+        "home_hits": home_hits,
+        "home_hr": home_hr,
+        "away_hits": away_hits,
+        "away_hr": away_hr,
+        "status": status,
+    }
 
-# ---------------------- upsert writer ----------------------
-def append_csv(out_csv: str, new_rows: list[dict], since: str | None = None, until: str | None = None):
+def crawl_one_game(driver: webdriver.Chrome, game_id: str, game_date: str) -> Dict[str, Optional[str]]:
+    url = REVIEW_URL.format(gid=game_id, gdt=game_date)
+    driver.get(url)
+    # 리뷰 섹션이 로드되기를 잠깐 대기
+    try:
+        WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "#txtStadium, #tblScoreboard1, #tblScoreboard3"))
+        )
+    except Exception:
+        pass
+    html = driver.page_source
+    data = parse_review_page_html(html)
+    data["date"] = pd.to_datetime(game_date).date()
+    data["gameId"] = game_id
+    data["section"] = "REVIEW"
+    data["review_url"] = url
+    return data
+
+def crawl_day(driver: webdriver.Chrome, d: str) -> pd.DataFrame:
     """
-    기존 CSV에 덧붙이되, since..until 구간은 먼저 제거하고 새 데이터로 교체(업서트).
+    1) 해당 날짜 일정 페이지에서 리뷰가 있는 경기의 gameId를 수집
+    2) 각 gameId의 REVIEW 페이지를 파싱
+    3) 결과 DataFrame 반환
     """
-    os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
-    new_df = pd.DataFrame(new_rows)
-    cols = [
-        "date","stadium","away_team","home_team",
-        "away_score","home_score","away_result","home_result",
-        "away_hit","home_hit","away_hr","home_hr",
-        "away_ab","home_ab","away_avg","home_avg"
+    game_ids = get_game_ids_for_date(driver, d)
+    rows = []
+    if not game_ids:
+        # 리뷰 버튼이 안보이는 날(비/취소), 또는 사이트 구조 변경 등
+        # 최소한 일정 페이지에서 팀/예정 여부라도 만들어 둘 수 있지만,
+        # 여기서는 empty 반환
+        return pd.DataFrame()
+
+    for gid in game_ids:
+        try:
+            row = crawl_one_game(driver, gid, d)
+            rows.append(row)
+        except Exception as e:
+            # 실패한 건 '예정'에 준하는 레코드로 최소 보존
+            rows.append({
+                "date": pd.to_datetime(d).date(),
+                "gameId": gid,
+                "section": "REVIEW",
+                "review_url": REVIEW_URL.format(gid=gid, gdt=d),
+                "stadium": None, "home": None, "away": None,
+                "home_score": None, "away_score": None,
+                "home_result": None, "away_result": None,
+                "home_hits": None, "home_hr": None,
+                "away_hits": None, "away_hr": None,
+                "status": "예정",
+                "_error": str(e),
+            })
+
+    df = pd.DataFrame(rows)
+    # 정렬/형 변환
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+    order = [
+        "date","gameId","stadium","home","away",
+        "home_score","away_score","home_result","away_result",
+        "home_hits","home_hr","away_hits","away_hr",
+        "status","section","review_url"
     ]
-    for c in cols:
-        if c not in new_df.columns:
-            new_df[c] = pd.Series([None]*len(new_df))
-    new_df = new_df[cols]
+    cols = [c for c in order if c in df.columns] + [c for c in df.columns if c not in order]
+    df = df[cols]
+    return df
 
-    if os.path.exists(out_csv):
-        old = pd.read_csv(out_csv, encoding="utf-8-sig")
-        for c in cols:
-            if c not in old.columns:
-                old[c] = pd.Series([None]*len(old))
-        old = old[cols]
+# -----------------------------
+# 메인
+# -----------------------------
+def main(since: Optional[str] = None, until: Optional[str] = None, out_csv: str = OUT_CSV):
+    since = since or os.getenv("SINCE", DEFAULT_SINCE)
+    until = until or os.getenv("UNTIL", None)
 
-        # 겹치는 날짜 범위 제거 후 새 데이터 삽입
-        if since and until and not old.empty:
-            s_iso = _yyyymmdd_to_iso(since)
-            u_iso = _yyyymmdd_to_iso(until)
-            mask = (pd.to_datetime(old["date"]) < pd.to_datetime(s_iso)) | (pd.to_datetime(old["date"]) > pd.to_datetime(u_iso))
-            old = old.loc[mask]
-        out = pd.concat([old, new_df], ignore_index=True)
-    else:
-        out = new_df
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
 
-    out = out.sort_values(["date","stadium","away_team","home_team"]).reset_index(drop=True)
-    out.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"[INFO] upserted {len(new_df)} rows -> {out_csv}")
+    df_old = load_existing(out_csv)
+    targets = build_target_dates(since, until, df_old)
 
-# ---------------------- CLI main ----------------------
-def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--since", default=None, help="YYYYMMDD (생략 시 append-mode: 기존 CSV 마지막+1)")
-    ap.add_argument("--until", default=None, help="YYYYMMDD (생략 시 어제)")
-    ap.add_argument("--out",   default="data/kbo_latest.csv")
-    ap.add_argument("--force", default="false", help="checkpoints 무시 여부(true/false)")
-    args = ap.parse_args()
-
-    force_refresh = str(args.force).lower() in ("1","true","yes")
-
-    rng = days_append_mode(args.out, args.since, args.until)
-    if not rng:
+    if not targets:
+        print("[INFO] 수집 대상 날짜가 없습니다.")
         return
 
-    crawler = UltraPreciseKBOCrawler(headless=True)
+    driver = make_driver()
+    all_daily = []
     try:
-        df = crawler.crawl_kbo_games(rng, force_refresh=force_refresh)
-        rows = df.to_dict("records")
-        if rows:
-            # since..until 범위를 넘겨서 해당 구간을 교체(업서트)
-            append_csv(args.out, rows, since=rng[0], until=rng[-1])
-        else:
-            print("[INFO] 신규 행 없음")
+        for d in targets:
+            print(f"[INFO] {d} 수집 시작...")
+            df_d = crawl_day(driver, d)
+            if df_d is not None and not df_d.empty:
+                all_daily.append(df_d)
+            else:
+                print(f"[INFO] {d} : 수집 결과 없음(리뷰 버튼 미노출 등)")
     finally:
-        crawler.cleanup()
+        driver.quit()
+
+    if not all_daily:
+        # 정말로 아무것도 갱신할 게 없을 수 있음 (예정도 없고 전부 최신)
+        print("[INFO] 신규/갱신 데이터가 없습니다.")
+        return
+
+    df_new = pd.concat(all_daily, ignore_index=True)
+
+    if df_old is None or len(df_old) == 0:
+        df_out = df_new
+    else:
+        df_out = replace_by_gameid(df_old, df_new)
+
+    # 정렬
+    if "date" in df_out.columns:
+        df_out["date"] = pd.to_datetime(df_out["date"])
+        sort_keys = [k for k in ["date","stadium","home","away"] if k in df_out.columns]
+        df_out = df_out.sort_values(sort_keys, na_position="last")
+        df_out["date"] = df_out["date"].dt.date
+
+    df_out.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"[INFO] 저장 완료 → {out_csv} (rows={len(df_out)})")
 
 if __name__ == "__main__":
-    main()
+    main(
+        since=os.environ.get("SINCE"),
+        until=os.environ.get("UNTIL"),
+        out_csv=os.environ.get("OUT", OUT_CSV),
+    )
+
