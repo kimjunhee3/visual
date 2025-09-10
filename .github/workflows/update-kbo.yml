@@ -2,17 +2,34 @@ name: Update KBO CSV
 
 on:
   schedule:
-    # 23:30 KST 실행 (UTC 14:30). 리뷰 반영 지연 고려 시 추가로 새벽 재실행을 하나 더 두어도 좋음.
+    # 매일 23:30 KST (UTC 14:30)
     - cron: "30 14 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "YYYYMMDD (옵션, 하루/구간 시작)"
+        required: false
+      until:
+        description: "YYYYMMDD (옵션, 하루/구간 끝)"
+        required: false
+      manual_dates:
+        description: "콤마구분 날짜들 예: 20250901,20250903 (옵션)"
+        required: false
+      recent_re:
+        description: "최근 강제 재크롤 경기 수(기본 3)"
+        required: false
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Seoul
-      RECHECK_DAYS: "7"           # 최근 7일 재검사(예정 포함 시 강제 재크롤)
       OUT: data/kbo_latest.csv
+      RECHECK_DAYS: "7"
+      RECENT_RECRAWL_GAMES: ${{ github.event.inputs.recent_re != '' && github.event.inputs.recent_re || '3' }}
+      SINCE: ${{ github.event.inputs.since }}
+      UNTIL: ${{ github.event.inputs.until }}
+      MANUAL_DATES: ${{ github.event.inputs.manual_dates }}
 
     steps:
       - name: Checkout
@@ -23,26 +40,42 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install system libs (for Chrome)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libgbm1 libasound2 libxshmfence1 libgtk-3-0 libx11-xcb1 fonts-liberation
+
+      - name: Install Google Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
       - name: Install deps
         run: |
           python -m pip install -U pip
-          # 최소 의존성
-          pip install selenium==4.23.1 beautifulsoup4 pandas
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests==2.32.3 selenium==4.23.1 beautifulsoup4 pandas
+          fi
 
       - name: Run crawler (append-mode aware + pending refresh)
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
-          set -e
-          python KBO_crawl.py
+          set -ex
+          python -u KBO_crawl.py
 
       - name: Commit CSV if changed
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "data: refresh CSV (pending & recent ${RECHECK_DAYS}d recheck)"
+            git commit -m "data: refresh CSV (pending & recent recheck)"
           else
             echo "No file changes."
           fi
@@ -50,7 +83,6 @@ jobs:
       - name: Push
         if: ${{ !cancelled() }}
         run: |
-          # 로컬 브랜치가 origin보다 앞으로 갔을 때만 push
           AHEAD=$(git rev-list --left-right --count origin/$(git rev-parse --abbrev-ref HEAD)...HEAD | awk '{print $2}')
           if [[ "${AHEAD}" != "0" ]]; then
             git push
