@@ -1,94 +1,59 @@
 name: Update KBO CSV
 
 on:
-  workflow_dispatch:
-    inputs:
-      since:
-        description: "시작일(YYYYMMDD) — 비워두면 CSV 마지막+1일부터 자동"
-        required: false
-        default: ""
-      until:
-        description: "종료일(YYYYMMDD) — 비워두면 어제"
-        required: false
-        default: ""
-      force:
-        description: "체크포인트 무시 후 재수집할지 (true/false)"
-        required: false
-        default: "false"
   schedule:
-    # KST(+9) 기준 02:10 (UTC 17:10)
-    - cron: "10 17 * * *"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: kbo-csv-update
-  cancel-in-progress: true
+    # 23:30 KST 실행 (UTC 14:30). 리뷰 반영 지연 고려 시 추가로 새벽 재실행을 하나 더 두어도 좋음.
+    - cron: "30 14 * * *"
+  workflow_dispatch: {}
 
 jobs:
-  update:
+  crawl:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Seoul
-      PYTHONUNBUFFERED: "1"
+      RECHECK_DAYS: "7"           # 최근 7일 재검사(예정 포함 시 강제 재크롤)
+      OUT: data/kbo_latest.csv
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-
-      - name: Install ChromeDriver
-        uses: nanasess/setup-chromedriver@v2
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install selenium beautifulsoup4 lxml pandas
+          python -m pip install -U pip
+          # 최소 의존성
+          pip install selenium==4.23.1 beautifulsoup4 pandas
 
-      - name: Resolve inputs
-        id: ds
-        shell: bash
-        run: |
-          IN_SINCE="${{ github.event.inputs.since }}"
-          IN_UNTIL="${{ github.event.inputs.until }}"
-          FORCE="${{ github.event.inputs.force }}"
-          echo "since=$IN_SINCE"  >> $GITHUB_OUTPUT
-          echo "until=$IN_UNTIL"  >> $GITHUB_OUTPUT
-          echo "force=$FORCE"     >> $GITHUB_OUTPUT
-
-      - name: Run crawler (append-mode aware)
+      - name: Run crawler (append-mode aware + pending refresh)
         run: |
           set -e
-          python KBO_crawl.py \
-            --since "${{ steps.ds.outputs.since }}" \
-            --until "${{ steps.ds.outputs.until }}" \
-            --out   "data/kbo_latest.csv" \
-            --force "${{ steps.ds.outputs.force }}"
+          python KBO_crawl.py
 
       - name: Commit CSV if changed
-        id: commit
         run: |
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/kbo_latest.csv
-          if git diff --cached --quiet; then
-            echo "changes=false" >> $GITHUB_OUTPUT
-            echo "No changes to commit."
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "data: refresh CSV (pending & recent ${RECHECK_DAYS}d recheck)"
           else
-            git commit -m "chore(data): auto-update kbo_latest.csv [skip ci]"
-            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "No file changes."
           fi
 
       - name: Push
-        if: steps.commit.outputs.changes == 'true'
-        run: git push
-
+        if: ${{ !cancelled() }}
+        run: |
+          # 로컬 브랜치가 origin보다 앞으로 갔을 때만 push
+          AHEAD=$(git rev-list --left-right --count origin/$(git rev-parse --abbrev-ref HEAD)...HEAD | awk '{print $2}')
+          if [[ "${AHEAD}" != "0" ]]; then
+            git push
+          else
+            echo "Nothing to push."
+          fi
