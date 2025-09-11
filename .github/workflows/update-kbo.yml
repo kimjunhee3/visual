@@ -32,6 +32,8 @@ jobs:
     env:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
+      OUT_CSV: data/kbo_latest.csv
+      TMP_CSV: data/_last2days.csv
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,6 +55,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install selenium beautifulsoup4 lxml pandas
+
       - name: Resolve inputs
         id: ds
         shell: bash
@@ -63,27 +66,100 @@ jobs:
           echo "since=$IN_SINCE"  >> $GITHUB_OUTPUT
           echo "until=$IN_UNTIL"  >> $GITHUB_OUTPUT
           echo "force=$FORCE"     >> $GITHUB_OUTPUT
+
+      # 1) 일반 모드: 입력(또는 기본 로직)대로 전체 업데이트
       - name: Run crawler (append-mode aware)
         run: |
           set -e
+          mkdir -p "$(dirname "$OUT_CSV")"
           python KBO_crawl.py \
             --since "${{ steps.ds.outputs.since }}" \
             --until "${{ steps.ds.outputs.until }}" \
-            --out   "data/kbo_latest.csv" \
+            --out   "$OUT_CSV" \
             --force "${{ steps.ds.outputs.force }}"
+
+      # 2) KST 기준 '최근 2일(어제+그제)'은 무조건 재크롤링해서 TMP_CSV로 저장
+      - name: Compute last-2-days (KST)
+        id: kst
+        shell: bash
+        run: |
+          # 어제, 그제 (오늘은 진행중 경기/데이터 흔들림 방지)
+          Y1=$(date -d "yesterday" +%Y%m%d)
+          Y2=$(date -d "2 days ago" +%Y%m%d)
+          echo "y1=$Y1" >> $GITHUB_OUTPUT
+          echo "y2=$Y2" >> $GITHUB_OUTPUT
+          echo "range=$Y2~$Y1"
+
+      - name: Re-crawl last-2-days (force replace zone)
+        run: |
+          set -e
+          python KBO_crawl.py \
+            --since "${{ steps.kst.outputs.y2 }}" \
+            --until "${{ steps.kst.outputs.y1 }}" \
+            --out   "$TMP_CSV" \
+            --force "true"
+
+      # 3) 메인 CSV에서 해당 날짜(Y2..Y1) 구간을 드롭하고, TMP_CSV로 대체 → 덮어쓰기
+      - name: Replace last-2-days in OUT_CSV
+        shell: bash
+        run: |
+          python - << 'PY'
+          import sys, pandas as pd, os
+          out_csv = os.environ["OUT_CSV"]
+          tmp_csv = os.environ["TMP_CSV"]
+          if not os.path.exists(out_csv) or not os.path.exists(tmp_csv):
+            raise SystemExit("CSV not found for replacement step")
+
+          df_full = pd.read_csv(out_csv)
+          df_last2 = pd.read_csv(tmp_csv)
+
+          # 날짜 컬럼 통일적으로 파싱
+          def parse_date(df):
+            for c in ["경기일","date","game_date"]:
+              if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
+                return c
+            raise SystemExit("No date column in CSV")
+          col_full = parse_date(df_full)
+          col_last = parse_date(df_last2)
+
+          targets = set(df_last2[col_last].dropna().unique().tolist())
+          # 대상 날짜 제거
+          df_kept = df_full[~df_full[col_full].isin(targets)].copy()
+          # 스키마 맞추기(혹시 열 순서/이름이 다르면 공통열만 사용)
+          common = [c for c in df_kept.columns if c in df_last2.columns]
+          if len(common) == 0:
+            raise SystemExit("No common columns to merge")
+          merged = pd.concat(
+            [df_kept[common], df_last2[common]],
+            ignore_index=True
+          )
+
+          # 보기 좋게 정렬(날짜, 팀 있으면)
+          if col_full in merged.columns:
+            merged = merged.sort_values(col_full, kind="stable")
+          for key in ["팀","stadium","home","away"]:
+            if key in merged.columns:
+              merged = merged.sort_values([col_full, key], kind="stable")
+
+          merged.to_csv(out_csv, index=False, encoding="utf-8")
+          print(f"[ok] Replaced last-2-days rows → {out_csv}; rows={len(merged)}")
+          PY
+
+      # 4) 변경 시에만 커밋/푸시
       - name: Commit CSV if changed
         id: commit
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/kbo_latest.csv
+          git add "$OUT_CSV"
           if git diff --cached --quiet; then
             echo "changes=false" >> $GITHUB_OUTPUT
             echo "No changes to commit."
           else
-            git commit -m "chore(data): auto-update kbo_latest.csv [skip ci]"
+            git commit -m "chore(data): update kbo_latest.csv (force replace last-2-days) [skip ci]"
             echo "changes=true" >> $GITHUB_OUTPUT
-          fi
+
       - name: Push
         if: steps.commit.outputs.changes == 'true'
         run: git push
